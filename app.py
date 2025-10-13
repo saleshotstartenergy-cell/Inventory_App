@@ -13,6 +13,7 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv("APP_SECRET", "supersecret")
 
+
 # ---------------------------
 # DB Connection
 # ---------------------------
@@ -33,11 +34,80 @@ USERS = {
     "sales": {"password": "sales123", "role": "sales"}
 }
 
-# -------------------------------------
-# HELPERS
-# -------------------------------------
+# ---------------------------
+# Live Sync: Tally -> Railway
+# ---------------------------
+TALLY_URL = os.getenv("TALLY_GATEWAY_URL", "")
+TALLY_API_KEY = os.getenv("TALLY_API_KEY", "")
+
+def sync_from_tally():
+    """Pull data from Tally Gateway and update MySQL DB."""
+    headers = {"X-API-KEY": TALLY_API_KEY}
+
+    try:
+        items = requests.get(f"{TALLY_URL}/stock_items", headers=headers, timeout=15).json()
+        moves = requests.get(f"{TALLY_URL}/stock_movements", headers=headers, timeout=15).json()
+    except Exception as e:
+        return {"ok": False, "error": f"Tally fetch failed: {e}"}
+
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # --- Clear existing ---
+        cur.execute("TRUNCATE TABLE stock_items")
+        cur.execute("TRUNCATE TABLE stock_movements")
+
+        # --- Insert items ---
+        for i in items:
+            cur.execute("""
+                INSERT INTO stock_items (name, category, base_unit, opening_qty, opening_rate)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                i.get("name"),
+                i.get("category"),
+                i.get("base_unit"),
+                i.get("closing_qty", 0),
+                i.get("closing_rate", 0)
+            ))
+
+        # --- Insert movements ---
+        for m in moves:
+            cur.execute("""
+                INSERT INTO stock_movements (date, voucher_no, company, item, qty, rate, amount, movement_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                m.get("date"),
+                m.get("voucher_no"),
+                m.get("company"),
+                m.get("item"),
+                m.get("qty", 0),
+                m.get("rate", 0),
+                m.get("amount", 0),
+                m.get("movement_type")
+            ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"ok": True, "items": len(items), "movements": len(moves)}
+
+    except Exception as e:
+        return {"ok": False, "error": f"MySQL insert failed: {e}"}
+
+# ---------------------------
+# Manual trigger for sync
+# ---------------------------
+@app.route("/sync")
+def manual_sync():
+    """Manual endpoint to refresh DB from Tally."""
+    summary = sync_from_tally()
+    return jsonify(summary)
+
+# ---------------------------
+# Refresh Helpers (used by live routes)
+# ---------------------------
 def refresh_stock_items(data):
-    """Insert or update stock_items table."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("TRUNCATE TABLE stock_items")
@@ -56,7 +126,6 @@ def refresh_stock_items(data):
     conn.close()
 
 def refresh_stock_movements(data):
-    """Insert or update stock_movements table."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("TRUNCATE TABLE stock_movements")
@@ -78,24 +147,21 @@ def refresh_stock_movements(data):
     conn.commit()
     conn.close()
 
-# -------------------------------------
-# ROUTES
-# -------------------------------------
+# ---------------------------
+# Live Tally routes (auto sync)
+# ---------------------------
 @app.route("/live/stock_items")
 def live_stock_items():
-    tally_url = os.getenv("TALLY_GATEWAY_URL")
-    api_key = os.getenv("TALLY_API_KEY")
-
     try:
-        r = requests.get(f"{tally_url}/stock_items", headers={"X-API-KEY": api_key}, timeout=6)
+        r = requests.get(f"{TALLY_URL}/stock_items", headers={"X-API-KEY": TALLY_API_KEY}, timeout=10)
         if r.status_code == 200:
             data = r.json()
             refresh_stock_items(data)
             return jsonify({"source": "tally_live", "data": data})
     except Exception as e:
-        print("⚠️ Live Tally fetch failed:", e)
+        print("⚠️ Tally live fetch failed:", e)
 
-    # fallback from MySQL
+    # fallback
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
     cur.execute("SELECT * FROM stock_items ORDER BY name")
@@ -106,11 +172,8 @@ def live_stock_items():
 
 @app.route("/live/stock_movements")
 def live_stock_movements():
-    tally_url = os.getenv("TALLY_GATEWAY_URL")
-    api_key = os.getenv("TALLY_API_KEY")
-
     try:
-        r = requests.get(f"{tally_url}/stock_movements", headers={"X-API-KEY": api_key}, timeout=6)
+        r = requests.get(f"{TALLY_URL}/stock_movements", headers={"X-API-KEY": TALLY_API_KEY}, timeout=10)
         if r.status_code == 200:
             data = r.json()
             refresh_stock_movements(data)
@@ -125,10 +188,11 @@ def live_stock_movements():
     conn.close()
     return jsonify({"source": "cache", "data": rows})
 
-
+# ---------------------------
+# Verify DB Connection
+# ---------------------------
 @app.route("/debug/db")
 def debug_db():
-    """Quick debug route to verify DB connection & tables."""
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -139,9 +203,11 @@ def debug_db():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
-
+# ---------------------------
+# Frontend & UI routes
+# ---------------------------
 @app.route("/")
-def index():
+def home():
     return jsonify({"ok": True, "message": "Inventory app running"})
 
 
