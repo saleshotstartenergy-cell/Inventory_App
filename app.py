@@ -5,7 +5,8 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta, date
 import smtplib
 from email.mime.text import MIMEText
-
+import os, requests, mysql.connector
+from flask import Flask, jsonify
 # Load env vars
 load_dotenv()
 
@@ -31,6 +32,119 @@ USERS = {
     "admin": {"password": "admin123", "role": "admin"},
     "sales": {"password": "sales123", "role": "sales"}
 }
+
+# -------------------------------------
+# HELPERS
+# -------------------------------------
+def refresh_stock_items(data):
+    """Insert or update stock_items table."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("TRUNCATE TABLE stock_items")
+    for d in data:
+        cur.execute("""
+            INSERT INTO stock_items (name, category, base_unit, opening_qty, opening_rate)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            d.get("name"),
+            d.get("category"),
+            d.get("base_unit"),
+            d.get("closing_qty", 0),
+            d.get("closing_rate", 0)
+        ))
+    conn.commit()
+    conn.close()
+
+def refresh_stock_movements(data):
+    """Insert or update stock_movements table."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("TRUNCATE TABLE stock_movements")
+    for d in data:
+        cur.execute("""
+            INSERT INTO stock_movements
+            (date, voucher_no, company, item, qty, rate, amount, movement_type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            d.get("date"),
+            d.get("voucher_no"),
+            d.get("company"),
+            d.get("item"),
+            d.get("qty", 0),
+            d.get("rate", 0),
+            d.get("amount", 0),
+            d.get("movement_type")
+        ))
+    conn.commit()
+    conn.close()
+
+# -------------------------------------
+# ROUTES
+# -------------------------------------
+@app.route("/live/stock_items")
+def live_stock_items():
+    tally_url = os.getenv("TALLY_GATEWAY_URL")
+    api_key = os.getenv("TALLY_API_KEY")
+
+    try:
+        r = requests.get(f"{tally_url}/stock_items", headers={"X-API-KEY": api_key}, timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            refresh_stock_items(data)
+            return jsonify({"source": "tally_live", "data": data})
+    except Exception as e:
+        print("⚠️ Live Tally fetch failed:", e)
+
+    # fallback from MySQL
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM stock_items ORDER BY name")
+    rows = cur.fetchall()
+    conn.close()
+    return jsonify({"source": "cache", "data": rows})
+
+
+@app.route("/live/stock_movements")
+def live_stock_movements():
+    tally_url = os.getenv("TALLY_GATEWAY_URL")
+    api_key = os.getenv("TALLY_API_KEY")
+
+    try:
+        r = requests.get(f"{tally_url}/stock_movements", headers={"X-API-KEY": api_key}, timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            refresh_stock_movements(data)
+            return jsonify({"source": "tally_live", "data": data})
+    except Exception as e:
+        print("⚠️ Live movement fetch failed:", e)
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM stock_movements ORDER BY date DESC LIMIT 100")
+    rows = cur.fetchall()
+    conn.close()
+    return jsonify({"source": "cache", "data": rows})
+
+
+@app.route("/debug/db")
+def debug_db():
+    """Quick debug route to verify DB connection & tables."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SHOW TABLES;")
+        tables = [r[0] for r in cur.fetchall()]
+        conn.close()
+        return jsonify({"ok": True, "tables": tables})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/")
+def index():
+    return jsonify({"ok": True, "message": "Inventory app running"})
+
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
