@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ title or "Inventory App" }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!-- Bootstrap 4.6 -->
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    >
+    <style>
+        body {
+            background-color: #f8f9fa;
+            font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .navbar-brand {
+            font-weight: 600;
+            font-size: 1.2rem;
+        }
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+        }
+        .page-header h2 {
+            margin: 0;
+            font-weight: 600;
+        }
+        .card, .table {
+            border-radius: 0.5rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .btn-sm {
+            border-radius: 0.25rem !important;
+        }
+        .navbar .form-inline input {
+            border-radius: 0.25rem;
+        }
+        footer {
+            text-align: center;
+            padding: 15px;
+            color: #6c757d;
+            font-size: 0.9rem;
+            margin-top: auto;
+        }
+        .table thead th {
+            background-color: #343a40;
+            color: white;
+            border: none;
+        }
+        .table-hover tbody tr:hover {
+            background-color: #f1f3f5;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ✅ Show navbar only when logged in -->
+    {% if session.get('user') %}
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark shadow-sm">
+        <a class="navbar-brand" href="{{ url_for('dashboard') }}">📊 Inventory</a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav"
+            aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+
+        <div class="collapse navbar-collapse" id="navbarNav">
+            <ul class="navbar-nav mr-auto">
+                <li class="nav-item {% if request.endpoint == 'dashboard' %}active{% endif %}">
+                    <a class="nav-link" href="{{ url_for('dashboard') }}">Dashboard</a>
+                </li>
+                <li class="nav-item {% if request.endpoint.startswith('sales_') %}active{% endif %}">
+                    <a class="nav-link" href="{{ url_for('sales_summary') }}">Sales</a>
+                </li>
+                <li class="nav-item {% if request.endpoint.startswith('stock_') %}active{% endif %}">
+                    <a class="nav-link" href="{{ url_for('stock_summary') }}">Stock</a>
+                </li>
+            </ul>
+
+            <ul class="navbar-nav">
+                <li class="nav-item">
+                    <span class="navbar-text text-light mr-3">
+                        👤 {{ session.get('user') }}
+                    </span>
+                </li>
+                <li class="nav-item">
+                    <a class="btn btn-outline-light btn-sm" href="{{ url_for('logout') }}">Logout</a>
+                </li>
+            </ul>
+        </div>
+    </nav>
+    {% endif %}
+
+    <!-- ✅ Main Content -->
+    <div class="container-fluid mt-4 mb-5">
+        {% block content %}{% endblock %}
+    </div>
+
+    <!-- ✅ Footer -->
+    <footer>
+        © {{ datetime.utcnow().year }} Inventory Management System · All rights reserved
+    </footer>
+
+    <!-- Bootstrap JS -->
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

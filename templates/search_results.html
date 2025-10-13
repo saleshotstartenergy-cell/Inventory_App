@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="page-header d-flex justify-content-between align-items-center mb-3">
+  <a href="{{ url_for('dashboard') }}" class="btn btn-outline-secondary btn-sm">⬅ Back</a>
+  <h2>Search Results for “{{ query }}”</h2>
+</div>
+
+{% if results %}
+<div class="table-responsive shadow-sm bg-white p-3 rounded">
+  <table class="table table-hover table-bordered align-middle mb-0">
+    <thead class="table-dark">
+      <tr>
+        <th>Item Name</th>
+        <th>Brand</th>
+        <th>Unit</th>
+        <th>Opening Qty</th>
+        <th>Rate</th>
+        <th>Value</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in results %}
+      <tr>
+        <td>{{ r.name }}</td>
+        <td>{{ r.category }}</td>
+        <td>{{ r.base_unit }}</td>
+        <td>{{ r.opening_qty }}</td>
+        <td>{{ r.opening_rate }}</td>
+        <td>{{ r.value|inr }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="alert alert-warning mt-3">
+  No results found for “{{ query }}”.
+</div>
+{% endif %}
+
+{% endblock %}
