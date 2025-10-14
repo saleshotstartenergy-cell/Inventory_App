@@ -7,14 +7,14 @@ import smtplib
 from email.mime.text import MIMEText
 import requests
 from flask_cors import CORS
-CORS(app)
+
 # Load env vars
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("APP_SECRET", "supersecret")
 
-
+CORS(app)
 # ---------------------------
 # DB Connection
 # ---------------------------
