@@ -193,37 +193,55 @@ def sales_summary():
 def sales_brands():
     q = request.args.get("q", "").strip()
     conn = get_connection()
-    cur = conn.cursor()
+    cur = conn.cursor(dictionary=True)
+
     if q:
         cur.execute("""
-            SELECT company, SUM(qty), SUM(amount)
+            SELECT 
+                IFNULL(company, 'Unknown') AS company,
+                SUM(qty) AS total_qty,
+                SUM(amount) AS total_value
             FROM stock_movements
             WHERE movement_type='OUT' AND company LIKE %s
-            GROUP BY company ORDER BY SUM(amount) DESC
+            GROUP BY company
+            ORDER BY total_value DESC
         """, (f"%{q}%",))
     else:
         cur.execute("""
-            SELECT company, SUM(qty), SUM(amount)
+            SELECT 
+                IFNULL(company, 'Unknown') AS company,
+                SUM(qty) AS total_qty,
+                SUM(amount) AS total_value
             FROM stock_movements
             WHERE movement_type='OUT'
-            GROUP BY company ORDER BY SUM(amount) DESC
+            GROUP BY company
+            ORDER BY total_value DESC
         """)
-    brands = [{"name": r[0], "qty": r[1], "value": r[2]} for r in cur.fetchall()]
+
+    brands = cur.fetchall()
     conn.close()
+
     return render_template("sales_brands.html", brands=brands, query=q)
 
 @app.route("/sales-summary/brands/<company>")
 def sales_monthly(company):
     conn = get_connection()
-    cur = conn.cursor()
+    cur = conn.cursor(dictionary=True)
+
     cur.execute("""
-        SELECT DATE_FORMAT(date, '%M %Y') AS month, SUM(amount)
+        SELECT 
+            DATE_FORMAT(date, '%M %Y') AS month_name,
+            DATE_FORMAT(date, '%Y-%m') AS month_key,
+            SUM(amount) AS total_value
         FROM stock_movements
         WHERE movement_type='OUT' AND company=%s
-        GROUP BY month ORDER BY month
+        GROUP BY month_key, month_name
+        ORDER BY month_key
     """, (company,))
-    months = [{"month": r[0], "value": r[1]} for r in cur.fetchall()]
+
+    months = cur.fetchall()
     conn.close()
+
     return render_template("sales_monthly.html", company=company, months=months)
 
 # ---------------------------
@@ -291,7 +309,7 @@ def stock_summary():
         FROM stock_items
         GROUP BY category ORDER BY category
     """)
-    rows = cur.fetchall()
+    rows =[{"brand": r[0], "value": r[1]} for r in cur.fetchall()]
     conn.close()
 
     return render_template("stock_summary.html", brands=rows, query=q)
@@ -306,24 +324,6 @@ def stock_items(brand):
     cur = conn.cursor(dictionary=True)
     user = session.get("user", "SalesUser")
 
-    # 🧾 Handle reservation form submission
-    if request.method == "POST":
-        item = request.form["item"]
-        qty = float(request.form["qty"])
-        reserved_by = request.form.get("reserved_by") or user
-        end_date = request.form.get("end_date")
-
-        if not end_date:
-            end_date = (date.today() + timedelta(days=3)).strftime("%Y-%m-%d")
-
-        cur.execute("""
-            INSERT INTO stock_reservations (item, reserved_by, qty, start_date, end_date, status)
-            VALUES (%s, %s, %s, CURDATE(), %s, 'ACTIVE')
-        """, (item, reserved_by, qty, end_date))
-        conn.commit()
-
-        send_reservation_notification(item, qty, reserved_by, end_date)
-
     # 🕒 Auto-expire old reservations
     cur.execute("""
         UPDATE stock_reservations
@@ -332,33 +332,17 @@ def stock_items(brand):
     """)
     conn.commit()
 
-    # 🔄 Auto-release reservations if stock sold in Tally
-    cur.execute("""
-        UPDATE stock_reservations r
-        JOIN (
-            SELECT i.name AS item,
-                   i.opening_qty - IFNULL(SUM(m.qty), 0) AS available_qty
-            FROM stock_items i
-            LEFT JOIN stock_movements m
-              ON i.name = m.item AND m.movement_type='OUT'
-            GROUP BY i.name, i.opening_qty
-        ) s ON r.item = s.item
-        SET r.status='CANCELLED'
-        WHERE r.status='ACTIVE' AND r.qty > s.available_qty;
-    """)
-    conn.commit()
-
-    # 🔍 Handle item-level search
     search_query = request.args.get("q", "").strip()
 
     if search_query:
         cur.execute("""
-            SELECT i.name AS item,
-                   i.opening_qty AS total_qty,
-                   IFNULL(SUM(r.qty), 0) AS reserved_qty,
-                   (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
-                   MAX(r.reserved_by) AS reserved_by,
-                   DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS end_date
+            SELECT 
+                i.name AS item,
+                i.opening_qty AS total_qty,
+                IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                MAX(r.reserved_by) AS reserved_by,
+                DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS end_date
             FROM stock_items i
             LEFT JOIN stock_reservations r
               ON i.name = r.item AND r.status='ACTIVE'
@@ -368,12 +352,13 @@ def stock_items(brand):
         """, (brand, f"%{search_query}%"))
     else:
         cur.execute("""
-            SELECT i.name AS item,
-                   i.opening_qty AS total_qty,
-                   IFNULL(SUM(r.qty), 0) AS reserved_qty,
-                   (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
-                   MAX(r.reserved_by) AS reserved_by,
-                   DATE_FORMAT(MAX(r.end_date), '%d-%m-%Y') AS end_date
+            SELECT 
+                i.name AS item,
+                i.opening_qty AS total_qty,
+                IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                MAX(r.reserved_by) AS reserved_by,
+                DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
             FROM stock_items i
             LEFT JOIN stock_reservations r
               ON i.name = r.item AND r.status='ACTIVE'
@@ -391,6 +376,7 @@ def stock_items(brand):
         items=rows,
         today=date.today()
     )
+
 
 # ---------------------------
 # Email Notification
