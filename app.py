@@ -503,7 +503,7 @@ CORS(app)
 # ---------------------------------------------------------
 # 🟢 1️⃣ Login API (optional for Flutter)
 # ---------------------------------------------------------
-@app.route("/api/login", methods=["POST"])
+@app.route("/flask/login", methods=["POST"])
 def api_login():
     """Flutter API login"""
     data = request.get_json()
