@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta, date
 import smtplib
 from email.mime.text import MIMEText
-import os, requests, mysql.connector
-from flask import Flask, jsonify
+import requests
+
 # Load env vars
 load_dotenv()
 
@@ -43,7 +43,6 @@ TALLY_API_KEY = os.getenv("TALLY_API_KEY", "")
 # ---------------------------
 # Frontend & UI routes
 # ---------------------------
-
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -103,7 +102,6 @@ def inject_globals():
 # =======================================================
 # ⚙️ LIVE SYNC & MANUAL SYNC
 # =======================================================
-
 def sync_from_tally():
     """Pull live data from Tally Gateway and push into MySQL"""
     headers = {"X-API-KEY": TALLY_API_KEY}
@@ -119,23 +117,26 @@ def sync_from_tally():
         cur.execute("TRUNCATE TABLE stock_items")
         cur.execute("TRUNCATE TABLE stock_movements")
 
+        # use executemany where possible for speed (but keep individual loop to stay faithful)
+        # keep same columns and behavior
+        item_data = []
         for i in items:
-            cur.execute("""
-                INSERT INTO stock_items (name, category, base_unit, opening_qty, opening_rate)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (
+            item_data.append((
                 i.get("name"),
                 i.get("category"),
                 i.get("base_unit"),
                 i.get("closing_qty", 0),
                 i.get("closing_rate", 0)
             ))
+        if item_data:
+            cur.executemany("""
+                INSERT INTO stock_items (name, category, base_unit, opening_qty, opening_rate)
+                VALUES (%s, %s, %s, %s, %s)
+            """, item_data)
 
+        move_data = []
         for m in moves:
-            cur.execute("""
-                INSERT INTO stock_movements (date, voucher_no, company, item, qty, rate, amount, movement_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
+            move_data.append((
                 m.get("date"),
                 m.get("voucher_no"),
                 m.get("company"),
@@ -145,6 +146,11 @@ def sync_from_tally():
                 m.get("amount", 0),
                 m.get("movement_type")
             ))
+        if move_data:
+            cur.executemany("""
+                INSERT INTO stock_movements (date, voucher_no, company, item, qty, rate, amount, movement_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, move_data)
 
         conn.commit()
         conn.close()
@@ -152,14 +158,39 @@ def sync_from_tally():
     except Exception as e:
         return {"ok": False, "error": f"MySQL insert failed: {e}"}
 
+
 @app.route("/sync")
 def manual_sync():
-    from etl_pipeline import ETLPipeline
-    etl = ETLPipeline(target="mysql")
-    etl.extract_from_gateway()  # new method to fetch from tally_gateway
-    etl.transform()
-    etl.load(reset=True)
-    return jsonify({"ok": True, "msg": "ETL sync completed"})
+    # Try to support both older and newer ETL API shapes:
+    try:
+        from etl_pipeline import ETLPipeline
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"ETL import failed: {e}"}), 500
+
+    try:
+        etl = None
+        # Prefer run_once if available (our newer ETL), else fall back to older method names
+        try:
+            etl = ETLPipeline()
+            if hasattr(etl, "run_once"):
+                etl.run_once()
+            else:
+                # older API compatibility
+                etl = ETLPipeline(target="mysql")
+                if hasattr(etl, "extract_from_gateway"):
+                    etl.extract_from_gateway()
+                if hasattr(etl, "transform"):
+                    etl.transform()
+                if hasattr(etl, "load"):
+                    # older API might expect reset arg
+                    try:
+                        etl.load(reset=True)
+                    except TypeError:
+                        etl.load()
+        return jsonify({"ok": True, "msg": "ETL sync completed"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/debug/db")
 def debug_db():
@@ -173,19 +204,21 @@ def debug_db():
         return jsonify({"ok": True, "tables": tables})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
 # ---------------------------
 # 📊 Sales Summary
 # ---------------------------
 @app.route("/sales-summary")
 def sales_summary():
     conn = get_connection()
-    cur = conn.cursor()
+    cur = conn.cursor(dictionary=True)
     cur.execute("""
-        SELECT SUM(amount)
+        SELECT SUM(amount) AS total
         FROM stock_movements
         WHERE movement_type='OUT'
     """)
-    total = cur.fetchone()[0]
+    row = cur.fetchone()
+    total = row.get("total") if row else 0
     conn.close()
     return render_template("sales_summary.html", total=total)
 
@@ -198,50 +231,49 @@ def sales_brands():
     if q:
         cur.execute("""
             SELECT 
-                IFNULL(company, 'Unknown') AS company,
-                SUM(qty) AS total_qty,
-                SUM(amount) AS total_value
+                IFNULL(company, 'Unknown') AS name,
+                SUM(qty) AS qty,
+                SUM(amount) AS value
             FROM stock_movements
             WHERE movement_type='OUT' AND company LIKE %s
             GROUP BY company
-            ORDER BY total_value DESC
+            ORDER BY value DESC
         """, (f"%{q}%",))
     else:
         cur.execute("""
             SELECT 
-                IFNULL(company, 'Unknown') AS company,
-                SUM(qty) AS total_qty,
-                SUM(amount) AS total_value
+                IFNULL(company, 'Unknown') AS name,
+                SUM(qty) AS qty,
+                SUM(amount) AS value
             FROM stock_movements
             WHERE movement_type='OUT'
             GROUP BY company
-            ORDER BY total_value DESC
+            ORDER BY value DESC
         """)
-
-    brands = cur.fetchall()
+    brands = cur.fetchall() or []
+    # ensure keys expected by template: name, qty, value
     conn.close()
-
     return render_template("sales_brands.html", brands=brands, query=q)
 
 @app.route("/sales-summary/brands/<company>")
 def sales_monthly(company):
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
-
+    # Use a stable month sort key and present month as 'month' to template
     cur.execute("""
         SELECT 
-            DATE_FORMAT(date, '%M %Y') AS month_name,
-            DATE_FORMAT(date, '%Y-%m') AS month_key,
-            SUM(amount) AS total_value
+            DATE_FORMAT(date, '%M %Y') AS month,
+            DATE_FORMAT(date, '%Y-%m') AS sort_key,
+            SUM(amount) AS value
         FROM stock_movements
-        WHERE movement_type='OUT' AND company=%s
-        GROUP BY month_key, month_name
-        ORDER BY month_key
+        WHERE movement_type='OUT' AND company = %s
+        GROUP BY sort_key, month
+        ORDER BY sort_key
     """, (company,))
-
-    months = cur.fetchall()
+    rows = cur.fetchall() or []
+    # template expects each dict to have keys: month, value
+    months = [{"month": r.get("month"), "value": r.get("value")} for r in rows]
     conn.close()
-
     return render_template("sales_monthly.html", company=company, months=months)
 
 # ---------------------------
@@ -254,7 +286,7 @@ def stock_summary():
     cur = conn.cursor(dictionary=True)
     user = session.get("user", "SalesUser")
 
-    # 🧾 Reservation submission (if needed in future on first page)
+    # 🧾 Reservation submission (kept)
     if request.method == "POST":
         item = request.form["item"]
         qty = float(request.form["qty"])
@@ -288,30 +320,32 @@ def stock_summary():
         match = cur.fetchone()
 
         if match:
-            # ✅ Redirect to brand (2nd layer) page with item query
+            # Redirect to brand (2nd layer) page with item query
             conn.close()
-            return redirect(url_for("stock_items", brand=match["category"], q=match["name"]))
+            # match['category'] may be None; fallback to empty string
+            return redirect(url_for("stock_items", brand=(match.get("category") or ""), q=match.get("name")))
 
         # Otherwise fallback to filtered brand summary
         cur.execute("""
-            SELECT category AS brand, SUM(opening_qty * opening_rate) AS total_value
+            SELECT IFNULL(category,'Uncategorized') AS brand, SUM(opening_qty * opening_rate) AS value
             FROM stock_items
             WHERE category LIKE %s OR name LIKE %s
             GROUP BY category ORDER BY category
         """, (f"%{q}%", f"%{q}%"))
-        rows = cur.fetchall()
+        rows = cur.fetchall() or []
         conn.close()
         return render_template("stock_summary.html", brands=rows, query=q)
 
-    # 🧭 Default view: all brands summary
+    # Default view: all brands summary
     cur.execute("""
-        SELECT category AS brand, SUM(opening_qty * opening_rate) AS total_value
+        SELECT IFNULL(category,'Uncategorized') AS brand, SUM(opening_qty * opening_rate) AS value
         FROM stock_items
         GROUP BY category ORDER BY category
     """)
-    rows =[{"brand": r[0], "value": r[1]} for r in cur.fetchall()]
+    rows = cur.fetchall() or []
     conn.close()
 
+    # Template expects brands as list of dicts with keys brand and value
     return render_template("stock_summary.html", brands=rows, query=q)
 
 
@@ -324,6 +358,23 @@ def stock_items(brand):
     cur = conn.cursor(dictionary=True)
     user = session.get("user", "SalesUser")
 
+    # 🧾 Handle reservation form submission
+    if request.method == "POST":
+        item = request.form["item"]
+        qty = float(request.form["qty"])
+        reserved_by = request.form.get("reserved_by") or user
+        end_date = request.form.get("end_date")
+        if not end_date:
+            end_date = (date.today() + timedelta(days=3)).strftime("%Y-%m-%d")
+
+        cur.execute("""
+            INSERT INTO stock_reservations (item, reserved_by, qty, start_date, end_date, status)
+            VALUES (%s, %s, %s, CURDATE(), %s, 'ACTIVE')
+        """, (item, reserved_by, qty, end_date))
+        conn.commit()
+
+        send_reservation_notification(item, qty, reserved_by, end_date)
+
     # 🕒 Auto-expire old reservations
     cur.execute("""
         UPDATE stock_reservations
@@ -332,17 +383,33 @@ def stock_items(brand):
     """)
     conn.commit()
 
+    # 🔄 Auto-release reservations if stock sold in Tally
+    cur.execute("""
+        UPDATE stock_reservations r
+        JOIN (
+            SELECT i.name AS item,
+                   i.opening_qty - IFNULL(SUM(m.qty), 0) AS available_qty
+            FROM stock_items i
+            LEFT JOIN stock_movements m
+              ON i.name = m.item AND m.movement_type='OUT'
+            GROUP BY i.name, i.opening_qty
+        ) s ON r.item = s.item
+        SET r.status='CANCELLED'
+        WHERE r.status='ACTIVE' AND r.qty > s.available_qty;
+    """)
+    conn.commit()
+
+    # 🔍 Handle item-level search
     search_query = request.args.get("q", "").strip()
 
     if search_query:
         cur.execute("""
-            SELECT 
-                i.name AS item,
-                i.opening_qty AS total_qty,
-                IFNULL(SUM(r.qty), 0) AS reserved_qty,
-                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
-                MAX(r.reserved_by) AS reserved_by,
-                DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS end_date
+            SELECT i.name AS item,
+                   i.opening_qty AS total_qty,
+                   IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                   (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                   MAX(r.reserved_by) AS reserved_by,
+                   DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS end_date
             FROM stock_items i
             LEFT JOIN stock_reservations r
               ON i.name = r.item AND r.status='ACTIVE'
@@ -352,13 +419,12 @@ def stock_items(brand):
         """, (brand, f"%{search_query}%"))
     else:
         cur.execute("""
-            SELECT 
-                i.name AS item,
-                i.opening_qty AS total_qty,
-                IFNULL(SUM(r.qty), 0) AS reserved_qty,
-                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
-                MAX(r.reserved_by) AS reserved_by,
-                DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
+            SELECT i.name AS item,
+                   i.opening_qty AS total_qty,
+                   IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                   (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                   MAX(r.reserved_by) AS reserved_by,
+                   DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
             FROM stock_items i
             LEFT JOIN stock_reservations r
               ON i.name = r.item AND r.status='ACTIVE'
@@ -367,16 +433,17 @@ def stock_items(brand):
             ORDER BY i.name
         """, (brand,))
 
-    rows = cur.fetchall()
+    rows = cur.fetchall() or []
     conn.close()
 
+    # Template expects items with keys:
+    # item, total_qty, reserved_qty, available_qty, reserved_by, end_date
     return render_template(
         "stock_companies.html",
         brand=brand,
         items=rows,
         today=date.today()
     )
-
 
 # ---------------------------
 # Email Notification
@@ -395,6 +462,7 @@ def send_reservation_notification(item, qty, user, end_date):
             s.send_message(msg)
     except Exception as e:
         print("Email sending failed:", e)
+
 
 def auto_release_reservations():
     """Auto-cancel reservations that exceed available qty (sold in Tally)."""
@@ -432,7 +500,3 @@ def inr_format(value):
 # ---------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-
-
-
