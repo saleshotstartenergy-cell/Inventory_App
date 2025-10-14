@@ -217,8 +217,13 @@ def sales_summary():
     conn.close()
     return render_template("sales_summary.html", total=total)
 
+# -----------------------------------------------
+# 📊 SALES SUMMARY - BY BRAND (Total Sales Value Only)
+# -----------------------------------------------
+
 @app.route("/sales-summary/brands")
 def sales_brands():
+    """Show total sales value grouped by product brand (category)."""
     q = request.args.get("q", "").strip()
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
@@ -226,50 +231,59 @@ def sales_brands():
     if q:
         cur.execute("""
             SELECT 
-                IFNULL(company, 'Unknown') AS name,
-                SUM(qty) AS qty,
-                SUM(amount) AS value
-            FROM stock_movements
-            WHERE movement_type='OUT' AND company LIKE %s
-            GROUP BY company
+                TRIM(IFNULL(i.category, 'Uncategorized')) AS name,
+                SUM(m.amount) AS value
+            FROM stock_movements m
+            JOIN stock_items i ON m.item = i.name
+            WHERE m.movement_type='OUT' AND i.category LIKE %s
+            GROUP BY i.category
             ORDER BY value DESC
         """, (f"%{q}%",))
     else:
         cur.execute("""
             SELECT 
-                IFNULL(company, 'Unknown') AS name,
-                SUM(qty) AS qty,
-                SUM(amount) AS value
-            FROM stock_movements
-            WHERE movement_type='OUT'
-            GROUP BY company
+                TRIM(IFNULL(i.category, 'Uncategorized')) AS name,
+                SUM(m.amount) AS value
+            FROM stock_movements m
+            JOIN stock_items i ON m.item = i.name
+            WHERE m.movement_type='OUT'
+            GROUP BY i.category
             ORDER BY value DESC
         """)
+
     brands = cur.fetchall() or []
-    # ensure keys expected by template: name, qty, value
     conn.close()
+
     return render_template("sales_brands.html", brands=brands, query=q)
 
-@app.route("/sales-summary/brands/<company>")
-def sales_monthly(company):
+
+# -----------------------------------------------
+# 📊 SALES SUMMARY - MONTHLY SALES BY BRAND
+# -----------------------------------------------
+
+@app.route("/sales-summary/brands/<brand>")
+def sales_monthly(brand):
+    """Show monthly total sales value for a specific brand (category)."""
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
-    # Use a stable month sort key and present month as 'month' to template
+
     cur.execute("""
         SELECT 
-            DATE_FORMAT(date, '%M %Y') AS month,
-            DATE_FORMAT(date, '%Y-%m') AS sort_key,
-            SUM(amount) AS value
-        FROM stock_movements
-        WHERE movement_type='OUT' AND company = %s
+            DATE_FORMAT(m.date, '%M %Y') AS month,
+            DATE_FORMAT(m.date, '%Y-%m') AS sort_key,
+            SUM(m.amount) AS value
+        FROM stock_movements m
+        JOIN stock_items i ON m.item = i.name
+        WHERE m.movement_type='OUT' AND TRIM(i.category)=TRIM(%s)
         GROUP BY sort_key, month
         ORDER BY sort_key
-    """, (company,))
-    rows = cur.fetchall() or []
-    # template expects each dict to have keys: month, value
-    months = [{"month": r.get("month"), "value": r.get("value")} for r in rows]
+    """, (brand,))
+
+    months = cur.fetchall() or []
     conn.close()
-    return render_template("sales_monthly.html", company=company, months=months)
+
+    return render_template("sales_monthly.html", company=brand, months=months)
+
 
 # ---------------------------
 # 📦 Stock Summary (with smart item redirect + reserve support)
