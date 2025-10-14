@@ -1,8 +1,7 @@
 {
   "version": 2,
   "builds": [
-    { "src": "app.py", "use": "@vercel/python" },
-    { "src": "etl_pipeline.py", "use": "@vercel/python" }
+    { "src": "app.py", "use": "@vercel/python" }
   ],
   "routes": [
     { "src": "/(.*)", "dest": "app.py" }

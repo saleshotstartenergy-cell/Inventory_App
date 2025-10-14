@@ -154,10 +154,12 @@ def sync_from_tally():
 
 @app.route("/sync")
 def manual_sync():
-    """Manual sync trigger for admin"""
-    if "user" not in session or session["role"] != "admin":
-        return jsonify({"error": "Unauthorized"}), 403
-    return jsonify(sync_from_tally())
+    from etl_pipeline import ETLPipeline
+    etl = ETLPipeline(target="mysql")
+    etl.extract_from_gateway()  # new method to fetch from tally_gateway
+    etl.transform()
+    etl.load(reset=True)
+    return jsonify({"ok": True, "msg": "ETL sync completed"})
 
 @app.route("/debug/db")
 def debug_db():
