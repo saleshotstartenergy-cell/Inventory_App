@@ -505,14 +505,19 @@ CORS(app)
 # ---------------------------------------------------------
 @app.route("/api/login", methods=["POST"])
 def api_login():
+    """Flutter API login"""
     data = request.get_json()
-    user = data.get("username")
-    pwd = data.get("password")
-    if user in USERS and USERS[user]["password"] == pwd:
-        return jsonify({"ok": True, "user": user, "role": USERS[user]["role"]})
-    return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+    username = data.get("username", "")
+    password = data.get("password", "")
 
-
+    if username in USERS and USERS[username]["password"] == password:
+        return jsonify({
+            "ok": True,
+            "user": username,
+            "role": USERS[username]["role"]
+        }), 200
+    else:
+        return jsonify({"ok": False, "error": "Invalid credentials"}), 401
 # ---------------------------------------------------------
 # 🟢 2️⃣ Sales Summary (overall)
 # ---------------------------------------------------------
