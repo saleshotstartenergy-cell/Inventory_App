@@ -182,7 +182,7 @@ def sales_summary():
     cur = conn.cursor()
     cur.execute("""
         SELECT SUM(amount)
-        FROM stock_movementss
+        FROM stock_movements
         WHERE movement_type='OUT'
     """)
     total = cur.fetchone()[0]
