@@ -5,3 +5,5 @@ python-dotenv
 mysql-connector-python
 pymysql
 requests
+gunicorn
+schedule

@@ -1,19 +1,13 @@
 {
+  "version": 2,
   "builds": [
-    { "src": "app.py", "use": "@vercel/python" }
+    { "src": "app.py", "use": "@vercel/python" },
+    { "src": "etl_pipeline.py", "use": "@vercel/python" }
   ],
   "routes": [
     { "src": "/(.*)", "dest": "app.py" }
   ],
-  "functions": {
-    "api/etl_pipeline.py": {
-      "runtime": "python3.9"
-    }
-  },
   "crons": [
-    {
-      "path": "/api/etl_pipeline",
-      "schedule": "0 */30 * * * *"
-    }
+    { "path": "/sync", "schedule": "*/30 * * * *" }
   ]
 }
