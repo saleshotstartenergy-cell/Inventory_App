@@ -11,13 +11,12 @@
 <div class="table-responsive">
     <table class="table table-striped table-bordered table-sm">
         <thead class="thead-dark">
-            <tr><th>Company</th><th>Qty</th><th>Value</th></tr>
+            <tr><th>Company</th><th>Value</th></tr>
         </thead>
         <tbody>
             {% for b in brands %}
             <tr>
-                <td><a href="{{ url_for('sales_monthly', company=b.name) }}">{{ b.name }}</a></td>
-                <td>{{ b.qty }}</td>
+                <td><a href="{{ url_for('sales_monthly', brand=b.name) }}">{{ b.name }}</a></td>
                 <td>{{ b.value|inr }}</td>
             </tr>
             {% endfor %}

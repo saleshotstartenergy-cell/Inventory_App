@@ -499,10 +499,26 @@ def auto_release_reservations():
 # ---------------------------
 @app.template_filter("inr")
 def inr_format(value):
+    """Format number in Indian currency style like ₹12,34,567.89"""
     try:
-        return f"₹{float(value):,.2f}"
-    except:
+        value = float(value)
+    except (ValueError, TypeError):
         return value
+
+    # Split integer and decimal part
+    s = f"{value:.2f}"
+    if "." in s:
+        int_part, dec_part = s.split(".")
+    else:
+        int_part, dec_part = s, ""
+
+    # Indian grouping (last 3 digits, then 2-2)
+    if len(int_part) > 3:
+        int_part = int_part[-3:] if len(int_part) <= 3 else (
+            ",".join([int_part[:-3][::-1][i:i+2][::-1] for i in range(0, len(int_part[:-3]), 2)][::-1]) + "," + int_part[-3:]
+        )
+
+    return f"₹{int_part}.{dec_part}"
 
 # ---------------------------
 # Run Flask
