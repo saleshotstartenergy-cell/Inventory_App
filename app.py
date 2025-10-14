@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, date
 import smtplib
 from email.mime.text import MIMEText
 import requests
-
+from flask_cors import CORS
+CORS(app)
 # Load env vars
 load_dotenv()
 
@@ -492,6 +493,159 @@ def auto_release_reservations():
     """)
     conn.commit()
     conn.close()
+
+# =========================================================
+# ✅ API ROUTES FOR FLUTTER FRONTEND
+# =========================================================
+from flask_cors import CORS
+CORS(app)
+
+# ---------------------------------------------------------
+# 🟢 1️⃣ Login API (optional for Flutter)
+# ---------------------------------------------------------
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json()
+    user = data.get("username")
+    pwd = data.get("password")
+    if user in USERS and USERS[user]["password"] == pwd:
+        return jsonify({"ok": True, "user": user, "role": USERS[user]["role"]})
+    return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+
+
+# ---------------------------------------------------------
+# 🟢 2️⃣ Sales Summary (overall)
+# ---------------------------------------------------------
+@app.route("/api/sales-summary")
+def api_sales_summary():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT SUM(amount) AS total
+        FROM stock_movements
+        WHERE movement_type='OUT'
+    """)
+    total = cur.fetchone()[0] or 0
+    conn.close()
+    return jsonify({"ok": True, "total_sales": total})
+
+
+# ---------------------------------------------------------
+# 🟢 3️⃣ Sales by Brand (2nd layer)
+# ---------------------------------------------------------
+@app.route("/api/sales-summary/brands")
+def api_sales_brands():
+    q = request.args.get("q", "").strip()
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    if q:
+        cur.execute("""
+            SELECT 
+                TRIM(IFNULL(i.category, 'Uncategorized')) AS brand,
+                SUM(m.amount) AS value
+            FROM stock_movements m
+            JOIN stock_items i ON m.item = i.name
+            WHERE m.movement_type='OUT' AND i.category LIKE %s
+            GROUP BY i.category
+            ORDER BY value DESC
+        """, (f"%{q}%",))
+    else:
+        cur.execute("""
+            SELECT 
+                TRIM(IFNULL(i.category, 'Uncategorized')) AS brand,
+                SUM(m.amount) AS value
+            FROM stock_movements m
+            JOIN stock_items i ON m.item = i.name
+            WHERE m.movement_type='OUT'
+            GROUP BY i.category
+            ORDER BY value DESC
+        """)
+
+    data = cur.fetchall()
+    conn.close()
+    return jsonify({"ok": True, "brands": data})
+
+
+# ---------------------------------------------------------
+# 🟢 4️⃣ Monthly Sales for Brand (3rd layer)
+# ---------------------------------------------------------
+@app.route("/api/sales-summary/brands/<brand>")
+def api_sales_monthly(brand):
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT 
+            DATE_FORMAT(m.date, '%M %Y') AS month,
+            DATE_FORMAT(m.date, '%Y-%m') AS sort_key,
+            SUM(m.amount) AS value
+        FROM stock_movements m
+        JOIN stock_items i ON m.item = i.name
+        WHERE m.movement_type='OUT' AND TRIM(i.category)=TRIM(%s)
+        GROUP BY sort_key, month
+        ORDER BY sort_key
+    """, (brand,))
+    data = cur.fetchall()
+    conn.close()
+    return jsonify({"ok": True, "brand": brand, "months": data})
+
+
+# ---------------------------------------------------------
+# 🟢 5️⃣ Stock Summary (1st layer)
+# ---------------------------------------------------------
+@app.route("/api/stock-summary")
+def api_stock_summary():
+    q = request.args.get("q", "").strip()
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    if q:
+        cur.execute("""
+            SELECT category AS brand,
+                   SUM(opening_qty * opening_rate) AS value
+            FROM stock_items
+            WHERE category LIKE %s OR name LIKE %s
+            GROUP BY category
+            ORDER BY category
+        """, (f"%{q}%", f"%{q}%"))
+    else:
+        cur.execute("""
+            SELECT category AS brand,
+                   SUM(opening_qty * opening_rate) AS value
+            FROM stock_items
+            GROUP BY category
+            ORDER BY category
+        """)
+
+    data = cur.fetchall()
+    conn.close()
+    return jsonify({"ok": True, "brands": data})
+
+
+# ---------------------------------------------------------
+# 🟢 6️⃣ Items under Brand (2nd layer of stock)
+# ---------------------------------------------------------
+@app.route("/api/stock-summary/<brand>")
+def api_stock_items(brand):
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT i.name AS item,
+               i.opening_qty AS total_qty,
+               IFNULL(SUM(r.qty), 0) AS reserved_qty,
+               (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+               MAX(r.reserved_by) AS reserved_by,
+               DATE_FORMAT(MAX(r.end_date), '%d-%m-%Y') AS end_date
+        FROM stock_items i
+        LEFT JOIN stock_reservations r
+          ON i.name = r.item AND r.status='ACTIVE'
+        WHERE i.category=%s
+        GROUP BY i.name, i.opening_qty
+        ORDER BY i.name
+    """, (brand,))
+    data = cur.fetchall()
+    conn.close()
+    return jsonify({"ok": True, "brand": brand, "items": data})
 
 
 # ---------------------------
