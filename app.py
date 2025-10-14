@@ -646,7 +646,28 @@ def api_stock_items(brand):
     data = cur.fetchall()
     conn.close()
     return jsonify({"ok": True, "brand": brand, "items": data})
-
+# ---------------------------------------------------------
+# 🟢 7️⃣ Search Endpoint
+@app.route("/api/search")
+def api_search():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"ok": True, "results": []})
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT 
+            name, category, base_unit,
+            opening_qty, opening_rate,
+            (opening_qty * opening_rate) AS value
+        FROM stock_items
+        WHERE name LIKE %s OR category LIKE %s
+        ORDER BY category, name
+        LIMIT 50
+    """, (f"%{q}%", f"%{q}%"))
+    results = cur.fetchall()
+    conn.close()
+    return jsonify({"ok": True, "results": results})
 
 # ---------------------------
 # Custom INR filter
