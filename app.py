@@ -168,25 +168,20 @@ def manual_sync():
         return jsonify({"ok": False, "error": f"ETL import failed: {e}"}), 500
 
     try:
-        etl = None
-        # Prefer run_once if available (our newer ETL), else fall back to older method names
-        try:
-            etl = ETLPipeline()
-            if hasattr(etl, "run_once"):
-                etl.run_once()
-            else:
-                # older API compatibility
-                etl = ETLPipeline(target="mysql")
-                if hasattr(etl, "extract_from_gateway"):
-                    etl.extract_from_gateway()
-                if hasattr(etl, "transform"):
-                    etl.transform()
-                if hasattr(etl, "load"):
-                    # older API might expect reset arg
-                    try:
-                        etl.load(reset=True)
-                    except TypeError:
-                        etl.load()
+        etl = ETLPipeline()
+        # Support both new and old ETL APIs
+        if hasattr(etl, "run_once"):
+            etl.run_once()
+        else:
+            if hasattr(etl, "extract_from_gateway"):
+                etl.extract_from_gateway()
+            if hasattr(etl, "transform"):
+                etl.transform()
+            if hasattr(etl, "load"):
+                try:
+                    etl.load(reset=True)
+                except TypeError:
+                    etl.load()
         return jsonify({"ok": True, "msg": "ETL sync completed"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
