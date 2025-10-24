@@ -7,6 +7,7 @@ import smtplib
 from email.mime.text import MIMEText
 import requests
 from flask_cors import CORS
+import decimal
 
 # Load env vars
 load_dotenv()
@@ -14,7 +15,9 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv("APP_SECRET", "supersecret")
 
+# Enable CORS for API access from your Flutter/web clients
 CORS(app)
+
 # ---------------------------
 # DB Connection
 # ---------------------------
@@ -28,18 +31,64 @@ def get_connection():
     )
 
 # ---------------------------
+# Helper: convert non-json-native types
+# ---------------------------
+def convert_decimals(obj):
+    """
+    Recursively convert Decimal and other non-JSON-native types to JSON-native types.
+    - decimal.Decimal -> float
+    - bytes -> utf-8 string
+    - datetime/date -> ISO string
+    - dict/list/tuple -> converted recursively
+    """
+    if obj is None:
+        return None
+
+    # Decimal -> float
+    if isinstance(obj, decimal.Decimal):
+        try:
+            return float(obj)
+        except Exception:
+            return 0.0
+
+    # Native JSON types
+    if isinstance(obj, (int, float, str, bool)):
+        return obj
+
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8")
+        except Exception:
+            return str(obj)
+
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    if isinstance(obj, dict):
+        return {k: convert_decimals(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        return [convert_decimals(v) for v in obj]
+
+    # fallback: try to convert to float, else string
+    try:
+        return float(obj)
+    except Exception:
+        return str(obj)
+
+# ---------------------------
 # Auth (hardcoded for now)
 # ---------------------------
 USERS = {
     "admin": {"password": "admin123", "role": "admin"},
     "sales": {"password": "sales123", "role": "sales"}
 }
+
 # ---------------------------
 # Environment & Tally Info
 # ---------------------------
 TALLY_URL = os.getenv("TALLY_GATEWAY_URL", "")
 TALLY_API_KEY = os.getenv("TALLY_API_KEY", "")
-
 
 # ---------------------------
 # Frontend & UI routes
@@ -95,7 +144,6 @@ def search():
     conn.close()
     return render_template("search_results.html", query=query, results=results)
 
-
 @app.context_processor
 def inject_globals():
     return {'datetime': datetime, 'timedelta': timedelta}
@@ -118,8 +166,6 @@ def sync_from_tally():
         cur.execute("TRUNCATE TABLE stock_items")
         cur.execute("TRUNCATE TABLE stock_movements")
 
-        # use executemany where possible for speed (but keep individual loop to stay faithful)
-        # keep same columns and behavior
         item_data = []
         for i in items:
             item_data.append((
@@ -159,7 +205,6 @@ def sync_from_tally():
     except Exception as e:
         return {"ok": False, "error": f"MySQL insert failed: {e}"}
 
-
 @app.route("/sync")
 def manual_sync():
     # Try to support both older and newer ETL API shapes:
@@ -170,7 +215,6 @@ def manual_sync():
 
     try:
         etl = ETLPipeline()
-        # Support both new and old ETL APIs
         if hasattr(etl, "run_once"):
             etl.run_once()
         else:
@@ -187,7 +231,6 @@ def manual_sync():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 @app.route("/debug/db")
 def debug_db():
     """Check MySQL connection"""
@@ -202,29 +245,28 @@ def debug_db():
         return jsonify({"ok": False, "error": str(e)})
 
 # ---------------------------
-# 📊 Sales Summary
+# 📊 Sales Summary (overall) - HTML
 # ---------------------------
 @app.route("/sales-summary")
 def sales_summary():
     conn = get_connection()
-    cur = conn.cursor(dictionary=True)
+    cur = conn.cursor()
     cur.execute("""
         SELECT SUM(amount) AS total
         FROM stock_movements
         WHERE movement_type='OUT'
     """)
     row = cur.fetchone()
-    total = row.get("total") if row else 0
+    total = row.get("total") if row and isinstance(row, dict) else (row[0] if row else 0)
+    # For the HTML view we keep the template rendering; templates can handle formatting.
     conn.close()
     return render_template("sales_summary.html", total=total)
 
 # -----------------------------------------------
-# 📊 SALES SUMMARY - BY BRAND (Total Sales Value Only)
+# 📊 SALES SUMMARY - BY BRAND (Total Sales Value Only) - HTML
 # -----------------------------------------------
-
 @app.route("/sales-summary/brands")
 def sales_brands():
-    """Show total sales value grouped by product brand (category)."""
     q = request.args.get("q", "").strip()
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
@@ -254,17 +296,13 @@ def sales_brands():
 
     brands = cur.fetchall() or []
     conn.close()
-
     return render_template("sales_brands.html", brands=brands, query=q)
 
-
 # -----------------------------------------------
-# 📊 SALES SUMMARY - MONTHLY SALES BY BRAND
+# 📊 SALES SUMMARY - MONTHLY SALES BY BRAND - HTML
 # -----------------------------------------------
-
 @app.route("/sales-summary/brands/<brand>")
 def sales_monthly(brand):
-    """Show monthly total sales value for a specific brand (category)."""
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
@@ -282,12 +320,10 @@ def sales_monthly(brand):
 
     months = cur.fetchall() or []
     conn.close()
-
     return render_template("sales_monthly.html", company=brand, months=months)
 
-
 # ---------------------------
-# 📦 Stock Summary (with smart item redirect + reserve support)
+# 📦 Stock Summary (with smart item redirect + reserve support) - HTML
 # ---------------------------
 @app.route("/stock-summary", methods=["GET", "POST"])
 def stock_summary():
@@ -296,7 +332,7 @@ def stock_summary():
     cur = conn.cursor(dictionary=True)
     user = session.get("user", "SalesUser")
 
-    # 🧾 Reservation submission (kept)
+    # Reservation submission
     if request.method == "POST":
         item = request.form["item"]
         qty = float(request.form["qty"])
@@ -310,7 +346,7 @@ def stock_summary():
         conn.commit()
         send_reservation_notification(item, qty, user, end_date)
 
-    # 🕒 Auto-expire old reservations
+    # Auto-expire old reservations
     cur.execute("""
         UPDATE stock_reservations
         SET status='EXPIRED'
@@ -318,9 +354,7 @@ def stock_summary():
     """)
     conn.commit()
 
-    # 🔍 If user searched for something
     if q:
-        # Check if it matches a specific item
         cur.execute("""
             SELECT name, category
             FROM stock_items
@@ -330,12 +364,9 @@ def stock_summary():
         match = cur.fetchone()
 
         if match:
-            # Redirect to brand (2nd layer) page with item query
             conn.close()
-            # match['category'] may be None; fallback to empty string
             return redirect(url_for("stock_items", brand=(match.get("category") or ""), q=match.get("name")))
 
-        # Otherwise fallback to filtered brand summary
         cur.execute("""
             SELECT IFNULL(category,'Uncategorized') AS brand, SUM(opening_qty * opening_rate) AS value
             FROM stock_items
@@ -346,7 +377,6 @@ def stock_summary():
         conn.close()
         return render_template("stock_summary.html", brands=rows, query=q)
 
-    # Default view: all brands summary
     cur.execute("""
         SELECT IFNULL(category,'Uncategorized') AS brand, SUM(opening_qty * opening_rate) AS value
         FROM stock_items
@@ -354,13 +384,10 @@ def stock_summary():
     """)
     rows = cur.fetchall() or []
     conn.close()
-
-    # Template expects brands as list of dicts with keys brand and value
     return render_template("stock_summary.html", brands=rows, query=q)
 
-
 # ---------------------------
-# 📦 Stock Items + Reservations
+# 📦 Stock Items + Reservations - HTML
 # ---------------------------
 @app.route("/stock-summary/<brand>", methods=["GET", "POST"])
 def stock_items(brand):
@@ -368,7 +395,6 @@ def stock_items(brand):
     cur = conn.cursor(dictionary=True)
     user = session.get("user", "SalesUser")
 
-    # 🧾 Handle reservation form submission
     if request.method == "POST":
         item = request.form["item"]
         qty = float(request.form["qty"])
@@ -385,7 +411,6 @@ def stock_items(brand):
 
         send_reservation_notification(item, qty, reserved_by, end_date)
 
-    # 🕒 Auto-expire old reservations
     cur.execute("""
         UPDATE stock_reservations
         SET status='EXPIRED'
@@ -393,7 +418,6 @@ def stock_items(brand):
     """)
     conn.commit()
 
-    # 🔄 Auto-release reservations if stock sold in Tally
     cur.execute("""
         UPDATE stock_reservations r
         JOIN (
@@ -409,7 +433,6 @@ def stock_items(brand):
     """)
     conn.commit()
 
-    # 🔍 Handle item-level search
     search_query = request.args.get("q", "").strip()
 
     if search_query:
@@ -446,8 +469,6 @@ def stock_items(brand):
     rows = cur.fetchall() or []
     conn.close()
 
-    # Template expects items with keys:
-    # item, total_qty, reserved_qty, available_qty, reserved_by, end_date
     return render_template(
         "stock_companies.html",
         brand=brand,
@@ -473,7 +494,6 @@ def send_reservation_notification(item, qty, user, end_date):
     except Exception as e:
         print("Email sending failed:", e)
 
-
 def auto_release_reservations():
     """Auto-cancel reservations that exceed available qty (sold in Tally)."""
     conn = get_connection()
@@ -497,8 +517,6 @@ def auto_release_reservations():
 # =========================================================
 # ✅ API ROUTES FOR FLUTTER FRONTEND
 # =========================================================
-from flask_cors import CORS
-CORS(app)
 
 # ---------------------------------------------------------
 # 🟢 1️⃣ Login API (optional for Flutter)
@@ -518,6 +536,7 @@ def api_login():
         }), 200
     else:
         return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+
 # ---------------------------------------------------------
 # 🟢 2️⃣ Sales Summary (overall)
 # ---------------------------------------------------------
@@ -530,10 +549,11 @@ def api_sales_summary():
         FROM stock_movements
         WHERE movement_type='OUT'
     """)
-    total = cur.fetchone()[0] or 0
+    row = cur.fetchone()
+    total = (row[0] if row and isinstance(row, (list, tuple)) else row.get("total")) if row else 0
     conn.close()
+    total = convert_decimals(total)
     return jsonify({"ok": True, "total_sales": total})
-
 
 # ---------------------------------------------------------
 # 🟢 3️⃣ Sales by Brand (2nd layer)
@@ -569,8 +589,8 @@ def api_sales_brands():
 
     data = cur.fetchall()
     conn.close()
+    data = convert_decimals(data)
     return jsonify({"ok": True, "brands": data})
-
 
 # ---------------------------------------------------------
 # 🟢 4️⃣ Monthly Sales for Brand (3rd layer)
@@ -592,8 +612,8 @@ def api_sales_monthly(brand):
     """, (brand,))
     data = cur.fetchall()
     conn.close()
+    data = convert_decimals(data)
     return jsonify({"ok": True, "brand": brand, "months": data})
-
 
 # ---------------------------------------------------------
 # 🟢 5️⃣ Stock Summary (1st layer)
@@ -624,8 +644,8 @@ def api_stock_summary():
 
     data = cur.fetchall()
     conn.close()
+    data = convert_decimals(data)
     return jsonify({"ok": True, "brands": data})
-
 
 # ---------------------------------------------------------
 # 🟢 6️⃣ Items under Brand (2nd layer of stock)
@@ -650,9 +670,12 @@ def api_stock_items(brand):
     """, (brand,))
     data = cur.fetchall()
     conn.close()
+    data = convert_decimals(data)
     return jsonify({"ok": True, "brand": brand, "items": data})
+
 # ---------------------------------------------------------
 # 🟢 7️⃣ Search Endpoint
+# ---------------------------------------------------------
 @app.route("/api/search")
 def api_search():
     q = request.args.get("q", "").strip()
@@ -672,10 +695,11 @@ def api_search():
     """, (f"%{q}%", f"%{q}%"))
     results = cur.fetchall()
     conn.close()
+    results = convert_decimals(results)
     return jsonify({"ok": True, "results": results})
 
 # ---------------------------
-# Custom INR filter
+# Custom INR filter (template filter)
 # ---------------------------
 @app.template_filter("inr")
 def inr_format(value):
