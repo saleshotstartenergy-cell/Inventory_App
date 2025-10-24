@@ -723,6 +723,61 @@ def inr_format(value):
         )
 
     return f"₹{int_part}.{dec_part}"
+# ---------------------------
+# 🟢 API: Create a stock reservation (from Flutter)
+# ---------------------------
+@app.route("/api/stock-reserve", methods=["POST"])
+def api_stock_reserve():
+    """
+    Expected JSON body:
+    {
+      "item": "Item Name",
+      "qty": 5,
+      "days": 3,
+      "reserved_by": "sales"   # optional, if omitted we use session user or 'mobile'
+    }
+    """
+    data = request.get_json() or {}
+    item = data.get("item")
+    try:
+        # qty might be string; validate and coerce
+        qty = float(data.get("qty", 0))
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid qty"}), 400
+
+    days = int(data.get("days", 3)) if data.get("days") is not None else 3
+    reserved_by = data.get("reserved_by") or session.get("user") or "mobile"
+
+    if not item or qty <= 0:
+        return jsonify({"ok": False, "error": "Missing or invalid item/qty"}), 400
+
+    end_date = date.today() + timedelta(days=days)
+
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO stock_reservations (item, reserved_by, qty, start_date, end_date, status)
+            VALUES (%s, %s, %s, CURDATE(), %s, 'ACTIVE')
+        """, (item, reserved_by, qty, end_date))
+        conn.commit()
+        conn.close()
+
+        # send notification (best-effort)
+        try:
+            send_reservation_notification(item, qty, reserved_by, end_date)
+        except Exception as e:
+            # don't fail the operation if email fails; just log
+            print("Reservation created but email failed:", e)
+
+        return jsonify({"ok": True, "msg": "Reserved", "item": item, "qty": qty, "end_date": str(end_date)})
+    except Exception as e:
+        # catch DB errors
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
 
 # ---------------------------
 # Run Flask
