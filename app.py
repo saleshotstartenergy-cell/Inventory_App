@@ -8,7 +8,8 @@ from email.mime.text import MIMEText
 import requests
 from flask_cors import CORS
 import decimal
-
+from urllib.parse import unquote_plus
+import calendar
 # Load env vars
 load_dotenv()
 
@@ -595,25 +596,76 @@ def api_sales_brands():
 # ---------------------------------------------------------
 # 🟢 4️⃣ Monthly Sales for Brand (3rd layer)
 # ---------------------------------------------------------
-@app.route("/api/sales-summary/brands/<brand>")
+@app.route("/api/sales-summary/brands/<path:brand>")
 def api_sales_monthly(brand):
+    # decode the incoming path parameter (safer)
+    decoded_brand = unquote_plus(brand or "")
+    # optional year filter from query param (e.g. ?year=2025)
+    year_arg = request.args.get("year", "").strip()
+    year = None
+    try:
+        if year_arg:
+            year = int(year_arg)
+    except Exception:
+        year = None
+
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
-    cur.execute("""
+
+    # Build SQL with optional year filter
+    sql = """
         SELECT 
             DATE_FORMAT(m.date, '%M %Y') AS month,
             DATE_FORMAT(m.date, '%Y-%m') AS sort_key,
             SUM(m.amount) AS value
         FROM stock_movements m
         JOIN stock_items i ON m.item = i.name
-        WHERE m.movement_type='OUT' AND TRIM(i.category)=TRIM(%s)
-        GROUP BY sort_key, month
-        ORDER BY sort_key
-    """, (brand,))
+        WHERE m.movement_type = 'OUT'
+          AND LOWER(TRIM(i.category)) = LOWER(TRIM(%s))
+    """
+    params = [decoded_brand]
+
+    if year is not None:
+        sql += " AND YEAR(m.date) = %s"
+        params.append(year)
+
+    sql += " GROUP BY sort_key, month ORDER BY sort_key"
+
+    cur.execute(sql, tuple(params))
     data = cur.fetchall()
-    conn.close()
     data = convert_decimals(data)
-    return jsonify({"ok": True, "brand": brand, "months": data})
+
+    # If monthly rows are empty, also provide a brand-level total (helpful client-side)
+    total = None
+    if not data:
+        total_sql = """
+            SELECT SUM(m.amount) AS total
+            FROM stock_movements m
+            JOIN stock_items i ON m.item = i.name
+            WHERE m.movement_type = 'OUT'
+              AND LOWER(TRIM(i.category)) = LOWER(TRIM(%s))
+        """
+        tparams = [decoded_brand]
+        # optionally respect year when computing total if you prefer
+        # If you want total restricted to same year, uncomment the following:
+        if year is not None:
+            total_sql += " AND YEAR(m.date) = %s"
+            tparams.append(year)
+
+        cur.execute(total_sql, tuple(tparams))
+        tr = cur.fetchone()
+        if tr and tr.get("total") is not None:
+            # convert Decimal -> float if needed (your convert_decimals may already do this)
+            total = float(tr["total"])
+
+    cur.close()
+    conn.close()
+
+    resp = {"ok": True, "brand": decoded_brand, "months": data}
+    if total is not None:
+        resp["total"] = total
+
+    return jsonify(resp)
 
 # ---------------------------------------------------------
 # 🟢 5️⃣ Stock Summary (1st layer)
