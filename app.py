@@ -20,12 +20,7 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("APP_SECRET", "supersecret")
-CUSTOMER_ALLOWED_COMPANIES = [
-    "Novateur Electrical & Digital Systems Pvt.Ltd",
-    "elmeasure",
-    "socomec",
-    "kei"   # lowercase base keyword for any KEI variant
-]
+
 
 
 # Enable CORS for API access from your Flutter/web clients
@@ -43,6 +38,12 @@ def get_connection():
         port=int(os.getenv("MYSQL_PORT", 3306))
     )
 
+CUSTOMER_ALLOWED_COMPANY_KEYWORDS = [
+    "novateur electrical & digital systems pvt.ltd",
+    "elmeasure",
+    "socomec",
+    "kei"   # match all KEI variants via substring match
+]
 # ---------------------------
 # Helper: convert non-json-native types
 # ---------------------------
@@ -200,14 +201,22 @@ def requires_role(*roles):
         return wrapped
     return decorator
 
-def get_allowed_companies_for_user(user_id, user_role):
-    """
-    Return None if user should see all companies (admin/sales).
-    Return a list of lowercase keywords if restricted (customer).
-    """
-    if user_role in ("admin", "sales"):
+def get_allowed_filters_for_user(user):
+    """Return None => no restriction (admin/sales). Otherwise return list of SQL clauses + params."""
+    role = user.get("role")
+    if role in ("admin", "sales"):
         return None
-    return [c.lower() for c in CUSTOMER_ALLOWED_COMPANIES]
+    # customer => build SQL conditions and params
+    clauses = []
+    params = []
+    for kw in CUSTOMER_ALLOWED_COMPANY_KEYWORDS:
+        if kw == "kei":
+            clauses.append("LOWER(company) LIKE %s")
+            params.append("%kei%")
+        else:
+            clauses.append("LOWER(company) = %s")
+            params.append(kw)
+    return {"clauses": clauses, "params": params}
 
 # ---------------------------
 # Environment & Tally Info
@@ -807,21 +816,22 @@ def api_sales_monthly(brand):
 @app.route("/api/stocks", methods=["GET"])
 @token_or_session_required
 def api_get_stocks():
+    # This returns stock_movements rows filtered by allowed companies for the user
     user = g.user
-    allowed = get_allowed_companies_for_user(user["id"], user["role"])
-    sql = "SELECT id, date, voucher_no, company, item, qty, rate, amount, movement_type FROM stock_movements"
+    allowed = get_allowed_filters_for_user(user)
+
+    sql = """SELECT id, date, voucher_no, company, item, qty, rate, amount, movement_type
+             FROM stock_movements"""
     params = []
 
     if allowed is not None:
-        conditions = []
-        for kw in allowed:
-            if kw == "kei":
-                conditions.append("LOWER(company) LIKE %s")
-                params.append("%kei%")
-            else:
-                conditions.append("LOWER(company) = %s")
-                params.append(kw)
-        sql += " WHERE " + " OR ".join(conditions)
+        if not allowed["clauses"]:
+            return jsonify([])  # no allowed companies
+        where_sql = " WHERE " + " OR ".join(allowed["clauses"])
+        sql += where_sql
+        params = allowed["params"]
+
+    # optional additional filters (search, date) can be appended here
 
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
@@ -996,7 +1006,7 @@ def api_stock_reserve():
 @token_or_session_required
 def api_me():
     user = g.user
-    allowed = get_allowed_companies_for_user(user["id"], user["role"])
+    allowed = get_allowed_filters_for_user(user["id"], user["role"])
     return jsonify({
         "id": user.get("id"),
         "username": user.get("username"),
