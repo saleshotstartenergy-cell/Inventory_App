@@ -7,3 +7,4 @@ pymysql
 requests
 gunicorn
 schedule
+PyJWT==2.8.0
