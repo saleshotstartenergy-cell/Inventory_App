@@ -20,6 +20,13 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("APP_SECRET", "supersecret")
+CUSTOMER_ALLOWED_COMPANIES = [
+    "Novateur Electrical & Digital Systems Pvt.Ltd",
+    "elmeasure",
+    "socomec",
+    "kei"   # lowercase base keyword for any KEI variant
+]
+
 
 # Enable CORS for API access from your Flutter/web clients
 CORS(app)
@@ -193,6 +200,14 @@ def requires_role(*roles):
         return wrapped
     return decorator
 
+def get_allowed_companies_for_user(user_id, user_role):
+    """
+    Return None if user should see all companies (admin/sales).
+    Return a list of lowercase keywords if restricted (customer).
+    """
+    if user_role in ("admin", "sales"):
+        return None
+    return [c.lower() for c in CUSTOMER_ALLOWED_COMPANIES]
 
 # ---------------------------
 # Environment & Tally Info
@@ -660,6 +675,7 @@ def api_login():
 # 🟢 2️⃣ Sales Summary (overall)
 # ---------------------------------------------------------
 @app.route("/api/sales-summary")
+@requires_role("admin")
 def api_sales_summary():
     conn = get_connection()
     cur = conn.cursor()
@@ -788,6 +804,32 @@ def api_sales_monthly(brand):
 # ---------------------------------------------------------
 # 🟢 5️⃣ Stock Summary (1st layer)
 # ---------------------------------------------------------
+@app.route("/api/stocks", methods=["GET"])
+@token_or_session_required
+def api_get_stocks():
+    user = g.user
+    allowed = get_allowed_companies_for_user(user["id"], user["role"])
+    sql = "SELECT id, date, voucher_no, company, item, qty, rate, amount, movement_type FROM stock_movements"
+    params = []
+
+    if allowed is not None:
+        conditions = []
+        for kw in allowed:
+            if kw == "kei":
+                conditions.append("LOWER(company) LIKE %s")
+                params.append("%kei%")
+            else:
+                conditions.append("LOWER(company) = %s")
+                params.append(kw)
+        sql += " WHERE " + " OR ".join(conditions)
+
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    conn.close()
+    return jsonify(rows)
+
 @app.route("/api/stock-summary")
 def api_stock_summary():
     q = request.args.get("q", "").strip()
@@ -953,8 +995,14 @@ def api_stock_reserve():
 @app.route("/api/me")
 @token_or_session_required
 def api_me():
-    # g.user is set by decorator
-    return jsonify({"id": g.user.get("id"), "username": g.user.get("username"), "role": g.user.get("role")})
+    user = g.user
+    allowed = get_allowed_companies_for_user(user["id"], user["role"])
+    return jsonify({
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "role": user.get("role"),
+        "allowed_companies": allowed  # ['novateur...', 'elmeasure', 'socomec', 'kei']
+    })
 
 # List users (admin only)
 @app.route("/api/users", methods=["GET"])

@@ -62,6 +62,6 @@ CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
   username VARCHAR(100) NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,
-  role ENUM('admin','sales') NOT NULL DEFAULT 'sales',
+  role ENUM('admin','sales','customer') NOT NULL DEFAULT 'sales',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
