@@ -10,6 +10,10 @@ from flask_cors import CORS
 import decimal
 from urllib.parse import unquote_plus
 import calendar
+from functools import wraps
+from flask import g
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
 # Load env vars
 load_dotenv()
 
@@ -78,12 +82,116 @@ def convert_decimals(obj):
         return str(obj)
 
 # ---------------------------
-# Auth (hardcoded for now)
+# Auth: DB-backed users + helpers
 # ---------------------------
-USERS = {
-    "admin": {"password": "admin123", "role": "admin"},
-    "sales": {"password": "sales123", "role": "sales"}
-}
+# JWT secret: store it in env, fallback to flask secret key
+JWT_SECRET = os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or app.secret_key or "replace-this-in-prod"
+JWT_ALGO = "HS256"
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", 60*24))  # default 1 day
+
+def get_user_by_username(username):
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id, username, password_hash, role FROM users WHERE username=%s", (username,))
+    user = cur.fetchone()
+    conn.close()
+    return user
+
+def get_user_by_id(uid):
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id, username, role FROM users WHERE id=%s", (uid,))
+    user = cur.fetchone()
+    conn.close()
+    return user
+
+def create_user_db(username, password, role="sales"):
+    pwd_hash = generate_password_hash(password)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+                (username, pwd_hash, role))
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+def update_user_db(uid, role=None, password=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    if role is not None:
+        cur.execute("UPDATE users SET role=%s WHERE id=%s", (role, uid))
+    if password:
+        cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (generate_password_hash(password), uid))
+    conn.commit()
+    conn.close()
+
+def delete_user_db(uid):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE id=%s", (uid,))
+    conn.commit()
+    conn.close()
+
+def create_token(user_id, username, role, minutes=JWT_EXPIRE_MINUTES):
+    payload = {
+        "sub": user_id,
+        "username": username,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(minutes=minutes)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+def decode_token(token):
+    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+
+# Decorators for protecting endpoints (session-based or token-based)
+
+
+def token_or_session_required(f):
+    """Accepts either session-based login (web) or Bearer token (API). Sets g.user = {'id', 'username','role'}"""
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        # 1) check for Authorization header
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth.split(" ", 1)[1]
+            try:
+                payload = decode_token(token)
+            except Exception as e:
+                return jsonify({"error":"Invalid/expired token", "detail": str(e)}), 401
+            g.user = {"id": payload["sub"], "username": payload.get("username"), "role": payload.get("role")}
+            return f(*args, **kwargs)
+        # 2) fallback to flask session
+        if "user" in session:
+            g.user = {"id": session.get("user_id"), "username": session.get("user"), "role": session.get("role")}
+            return f(*args, **kwargs)
+        return jsonify({"error":"Authentication required"}), 401
+    return wrapped
+
+def requires_role(*roles):
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            if not hasattr(g, "user"):
+                # attempt to populate g.user
+                auth = request.headers.get("Authorization", "")
+                if auth.startswith("Bearer "):
+                    try:
+                        payload = decode_token(auth.split(" ", 1)[1])
+                        g.user = {"id": payload["sub"], "username": payload.get("username"), "role": payload.get("role")}
+                    except Exception as e:
+                        return jsonify({"error":"Invalid/expired token", "detail": str(e)}), 401
+                elif "user" in session:
+                    g.user = {"id": session.get("user_id"), "username": session.get("user"), "role": session.get("role")}
+                else:
+                    return jsonify({"error":"Authentication required"}), 401
+            if g.user.get("role") not in roles:
+                return jsonify({"error":"Forbidden"}), 403
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
 
 # ---------------------------
 # Environment & Tally Info
@@ -99,12 +207,16 @@ def login():
     if request.method == "POST":
         user = request.form["username"]
         pwd = request.form["password"]
-        if user in USERS and USERS[user]["password"] == pwd:
-            session["user"] = user
-            session["role"] = USERS[user]["role"]
+
+        u = get_user_by_username(user)
+        if u and check_password_hash(u["password_hash"], pwd):
+            session["user"] = u["username"]
+            session["user_id"] = u["id"]
+            session["role"] = u["role"]
             return redirect(url_for("dashboard"))
         return render_template("login.html", error="Invalid credentials")
     return render_template("login.html")
+
 
 @app.route("/logout")
 def logout():
@@ -515,6 +627,7 @@ def auto_release_reservations():
     conn.commit()
     conn.close()
 
+
 # =========================================================
 # ✅ API ROUTES FOR FLUTTER FRONTEND
 # =========================================================
@@ -524,19 +637,23 @@ def auto_release_reservations():
 # ---------------------------------------------------------
 @app.route("/flask/login", methods=["POST"])
 def api_login():
-    """Flutter API login"""
+    """Flutter API login - returns a JWT token and user info"""
     data = request.get_json()
-    username = data.get("username", "")
-    password = data.get("password", "")
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
 
-    if username in USERS and USERS[username]["password"] == password:
-        return jsonify({
-            "ok": True,
-            "user": username,
-            "role": USERS[username]["role"]
-        }), 200
-    else:
+    user = get_user_by_username(username)
+    if not user or not check_password_hash(user["password_hash"], password):
         return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+
+    token = create_token(user["id"], user["username"], user["role"])
+    return jsonify({
+        "ok": True,
+        "token": token,
+        "user": user["username"],
+        "role": user["role"]
+    }), 200
+
 
 # ---------------------------------------------------------
 # 🟢 2️⃣ Sales Summary (overall)
@@ -830,6 +947,86 @@ def api_stock_reserve():
         except Exception:
             pass
         return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
+    
+# current user info (works with token or session)
+@app.route("/api/me")
+@token_or_session_required
+def api_me():
+    # g.user is set by decorator
+    return jsonify({"id": g.user.get("id"), "username": g.user.get("username"), "role": g.user.get("role")})
+
+# List users (admin only)
+@app.route("/api/users", methods=["GET"])
+@requires_role("admin")
+def api_list_users():
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id, username, role, created_at FROM users ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    return jsonify(rows)
+
+# Create a user (admin)
+@app.route("/api/users", methods=["POST"])
+@requires_role("admin")
+def api_create_user():
+    data = request.get_json()
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    role = data.get("role") or "sales"
+    if not username or not password:
+        return jsonify({"error":"username and password required"}), 400
+    try:
+        new_id = create_user_db(username, password, role)
+        return jsonify({"id": new_id, "username": username, "role": role}), 201
+    except Exception as e:
+        return jsonify({"error":"Could not create user", "detail": str(e)}), 400
+
+# Update user (admin or user updating own password)
+@app.route("/api/users/<int:user_id>", methods=["PUT"])
+@token_or_session_required
+def api_update_user(user_id):
+    # Only admin can change role or update other users; a normal user can change own password
+    if (session.get("role") != "admin") and (g.user.get("role") != "admin") and (g.user.get("id") != user_id):
+        return jsonify({"error":"Forbidden"}), 403
+
+    data = request.get_json() or {}
+    role = data.get("role", None)
+    password = data.get("password", None)
+    # If non-admin tries to change role -> reject
+    if role and g.user.get("role") != "admin":
+        return jsonify({"error":"Only admin can change role"}), 403
+    try:
+        update_user_db(user_id, role=role, password=password)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error":"Could not update user", "detail": str(e)}), 400
+
+# Delete user (admin only)
+@app.route("/api/users/<int:user_id>", methods=["DELETE"])
+@requires_role("admin")
+def api_delete_user(user_id):
+    # protect last-admin deletion
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT role FROM users WHERE id=%s", (user_id,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        return jsonify({"error":"User not found"}), 404
+    if r["role"] == "admin":
+        cur.execute("SELECT COUNT(*) AS admins FROM users WHERE role='admin'")
+        admins = cur.fetchone().get("admins", 0)
+        if admins <= 1:
+            conn.close()
+            return jsonify({"error":"Cannot delete the last admin"}), 400
+    conn.close()
+    try:
+        delete_user_db(user_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error":"Could not delete user", "detail": str(e)}), 400
+
 
 # ---------------------------
 # Run Flask
