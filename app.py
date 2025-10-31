@@ -14,6 +14,7 @@ from functools import wraps
 from flask import g
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
+
 # Load env vars
 load_dotenv()
 

@@ -54,8 +54,9 @@ CREATE TABLE stock_reservations (
     status ENUM('ACTIVE','EXPIRED','CANCELLED') DEFAULT 'ACTIVE',
     remarks VARCHAR(255)
 );
+
 -- ----------------------
--- create users table
+-- USERS 
 -- ----------------------
 CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
