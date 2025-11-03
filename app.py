@@ -44,6 +44,14 @@ CUSTOMER_ALLOWED_COMPANY_KEYWORDS = [
     "socomec",
     "kei"   # match all KEI variants via substring match
 ]
+# human-friendly display list (client-readable)
+CUSTOMER_ALLOWED_COMPANY_DISPLAY = [
+    "Novateur Electrical & Digital Systems Pvt.Ltd",
+    "elmeasure",
+    "socomec",
+    "kei"
+]
+
 # ---------------------------
 # Helper: convert non-json-native types
 # ---------------------------
@@ -841,59 +849,137 @@ def api_get_stocks():
     return jsonify(rows)
 
 @app.route("/api/stock-summary")
+@token_or_session_required
 def api_stock_summary():
+    """
+    Returns brands (categories) with aggregated value.
+    If user is a customer, restrict results to brands that have movements for allowed companies.
+    """
     q = request.args.get("q", "").strip()
+    user = g.user
+    allowed = get_allowed_filters_for_user(user)  # returns None or {'clauses':..., 'params':[...]} 
+
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    if q:
-        cur.execute("""
-            SELECT category AS brand,
-                   SUM(opening_qty * opening_rate) AS value
-            FROM stock_items
-            WHERE category LIKE %s OR name LIKE %s
-            GROUP BY category
-            ORDER BY category
-        """, (f"%{q}%", f"%{q}%"))
+    if allowed is None:
+        # Admin / Sales: full view
+        if q:
+            cur.execute("""
+                SELECT category AS brand,
+                       SUM(opening_qty * opening_rate) AS value
+                FROM stock_items
+                WHERE category LIKE %s OR name LIKE %s
+                GROUP BY category
+                ORDER BY category
+            """, (f"%{q}%", f"%{q}%"))
+        else:
+            cur.execute("""
+                SELECT category AS brand,
+                       SUM(opening_qty * opening_rate) AS value
+                FROM stock_items
+                GROUP BY category
+                ORDER BY category
+            """)
     else:
-        cur.execute("""
-            SELECT category AS brand,
-                   SUM(opening_qty * opening_rate) AS value
-            FROM stock_items
-            GROUP BY category
-            ORDER BY category
-        """)
+        # Customer: restrict brands to those that have stock_movements for allowed companies
+        # We join stock_items -> stock_movements and apply company filters (avoids exposing other companies).
+        company_where = " OR ".join(allowed["clauses"])
+        params = allowed["params"].copy()
 
-    data = cur.fetchall()
+        if q:
+            sql = f"""
+                SELECT i.category AS brand,
+                       SUM(i.opening_qty * i.opening_rate) AS value
+                FROM stock_items i
+                JOIN stock_movements m ON i.name = m.item
+                WHERE ({company_where})
+                  AND (i.category LIKE %s OR i.name LIKE %s)
+                GROUP BY i.category
+                ORDER BY i.category
+            """
+            params.extend([f"%{q}%", f"%{q}%"])
+        else:
+            sql = f"""
+                SELECT i.category AS brand,
+                       SUM(i.opening_qty * i.opening_rate) AS value
+                FROM stock_items i
+                JOIN stock_movements m ON i.name = m.item
+                WHERE ({company_where})
+                GROUP BY i.category
+                ORDER BY i.category
+            """
+
+        cur.execute(sql, tuple(params))
+
+    data = cur.fetchall() or []
     conn.close()
     data = convert_decimals(data)
     return jsonify({"ok": True, "brands": data})
 
+
 # ---------------------------------------------------------
 # 🟢 6️⃣ Items under Brand (2nd layer of stock)
 # ---------------------------------------------------------
-@app.route("/api/stock-summary/<brand>")
+@app.route("/api/stock-summary/<path:brand>")
+@token_or_session_required
 def api_stock_items(brand):
+    """
+    Return items under a brand. If user is a customer, ensure items returned are only those
+    that have stock_movements for allowed companies.
+    """
+    decoded_brand = unquote_plus(brand or "")
+    user = g.user
+    allowed = get_allowed_filters_for_user(user)
+
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
-    cur.execute("""
-        SELECT i.name AS item,
-               i.opening_qty AS total_qty,
-               IFNULL(SUM(r.qty), 0) AS reserved_qty,
-               (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
-               MAX(r.reserved_by) AS reserved_by,
-               DATE_FORMAT(MAX(r.end_date), '%d-%m-%Y') AS end_date
-        FROM stock_items i
-        LEFT JOIN stock_reservations r
-          ON i.name = r.item AND r.status='ACTIVE'
-        WHERE i.category=%s
-        GROUP BY i.name, i.opening_qty
-        ORDER BY i.name
-    """, (brand,))
-    data = cur.fetchall()
+
+    if allowed is None:
+        # admin / sales - full list
+        cur.execute("""
+            SELECT i.name AS item,
+                   i.opening_qty AS total_qty,
+                   IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                   (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                   MAX(r.reserved_by) AS reserved_by,
+                   DATE_FORMAT(MAX(r.end_date), '%d-%m-%Y') AS end_date
+            FROM stock_items i
+            LEFT JOIN stock_reservations r
+              ON i.name = r.item AND r.status='ACTIVE'
+            WHERE i.category=%s
+            GROUP BY i.name, i.opening_qty
+            ORDER BY i.name
+        """, (decoded_brand,))
+    else:
+        # customer: ensure items are tied to allowed companies in stock_movements
+        company_where = " OR ".join(allowed["clauses"])
+        params = allowed["params"].copy()
+        params.insert(0, decoded_brand)  # brand is first param in WHERE i.category=%s AND (company filters)
+
+        sql = f"""
+            SELECT i.name AS item,
+                   i.opening_qty AS total_qty,
+                   IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                   (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                   MAX(r.reserved_by) AS reserved_by,
+                   DATE_FORMAT(MAX(r.end_date), '%d-%m-%Y') AS end_date
+            FROM stock_items i
+            LEFT JOIN stock_reservations r
+              ON i.name = r.item AND r.status='ACTIVE'
+            JOIN stock_movements m ON m.item = i.name
+            WHERE i.category=%s AND ({company_where})
+            GROUP BY i.name, i.opening_qty
+            ORDER BY i.name
+        """
+        cur.execute(sql, tuple(params))
+
+    rows = cur.fetchall() or []
     conn.close()
-    data = convert_decimals(data)
-    return jsonify({"ok": True, "brand": brand, "items": data})
+
+    data = convert_decimals(rows)
+    return jsonify({"ok": True, "brand": decoded_brand, "items": data})
+
 
 # ---------------------------------------------------------
 # 🟢 7️⃣ Search Endpoint
@@ -1001,18 +1087,28 @@ def api_stock_reserve():
             pass
         return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
     
-# current user info (works with token or session)
 @app.route("/api/me")
 @token_or_session_required
 def api_me():
+    """
+    Return current user info and a client-friendly allowed_companies list.
+    The allowed_companies is None for admin/sales, or a list of company display names for customers.
+    """
     user = g.user
-    allowed = get_allowed_filters_for_user(user["id"], user["role"])
+    # If user is admin/sales, return None to indicate unlimited access
+    if user.get("role") in ("admin", "sales"):
+        allowed_list = None
+    else:
+        # for customers return the hardcoded display names
+        allowed_list = CUSTOMER_ALLOWED_COMPANY_DISPLAY
+
     return jsonify({
         "id": user.get("id"),
         "username": user.get("username"),
         "role": user.get("role"),
-        "allowed_companies": allowed  # ['novateur...', 'elmeasure', 'socomec', 'kei']
+        "allowed_companies": allowed_list
     })
+
 
 # List users (admin only)
 @app.route("/api/users", methods=["GET"])
