@@ -921,7 +921,7 @@ def api_stock_summary():
 # ---------------------------------------------------------
 # 🟢 6️⃣ Items under Brand (2nd layer of stock)
 # ---------------------------------------------------------
-@app.route("/api/stock-summary/<path:brand>")
+@app.route("/api/stock-summary/<brand>")
 @token_or_session_required
 def api_stock_items(brand):
     """
