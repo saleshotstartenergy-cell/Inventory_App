@@ -882,8 +882,13 @@ def api_stock_summary():
                 ORDER BY category
             """)
     else:
+        # Customer: if allowed is present but there are no clauses -> no permitted companies -> return empty
+        if not allowed.get("clauses"):
+            conn.close()
+            # return empty brands list (ok==true so client knows no error)
+            return jsonify({"ok": True, "brands": []})
+
         # Customer: restrict brands to those that have stock_movements for allowed companies
-        # We join stock_items -> stock_movements and apply company filters (avoids exposing other companies).
         company_where = " OR ".join(allowed["clauses"])
         params = allowed["params"].copy()
 
@@ -911,6 +916,7 @@ def api_stock_summary():
             """
 
         cur.execute(sql, tuple(params))
+
 
     data = cur.fetchall() or []
     conn.close()
@@ -953,6 +959,10 @@ def api_stock_items(brand):
         """, (decoded_brand,))
     else:
         # customer: ensure items are tied to allowed companies in stock_movements
+        if not allowed.get("clauses"):
+            conn.close()
+            return jsonify({"ok": True, "brand": decoded_brand, "items": []})
+
         company_where = " OR ".join(allowed["clauses"])
         params = allowed["params"].copy()
         params.insert(0, decoded_brand)  # brand is first param in WHERE i.category=%s AND (company filters)
@@ -973,6 +983,7 @@ def api_stock_items(brand):
             ORDER BY i.name
         """
         cur.execute(sql, tuple(params))
+
 
     rows = cur.fetchall() or []
     conn.close()
