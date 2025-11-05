@@ -821,39 +821,13 @@ def api_sales_monthly(brand):
 # ---------------------------------------------------------
 # 🟢 5️⃣ Stock Summary (1st layer)
 # ---------------------------------------------------------
-@app.route("/api/stocks", methods=["GET"])
-@token_or_session_required
-def api_get_stocks():
-    # This returns stock_movements rows filtered by allowed companies for the user
-    user = g.user
-    allowed = get_allowed_filters_for_user(user)
-
-    sql = """SELECT id, date, voucher_no, company, item, qty, rate, amount, movement_type
-             FROM stock_movements"""
-    params = []
-
-    if allowed is not None:
-        if not allowed["clauses"]:
-            return jsonify([])  # no allowed companies
-        where_sql = " WHERE " + " OR ".join(allowed["clauses"])
-        sql += where_sql
-        params = allowed["params"]
-
-    # optional additional filters (search, date) can be appended here
-
-    conn = get_connection()
-    cur = conn.cursor(dictionary=True)
-    cur.execute(sql, params)
-    rows = cur.fetchall()
-    conn.close()
-    return jsonify(rows)
-
 @app.route("/api/stock-summary")
 @token_or_session_required
 def api_stock_summary():
     """
     Returns brands (categories) with aggregated value.
-    If user is a customer, restrict results to brands that have movements for allowed companies.
+    If user is a customer, restrict results to a small whitelist of brands
+    and apply company-based ACL (only brands that have movements for allowed companies).
     """
     q = request.args.get("q", "").strip()
     user = g.user
@@ -862,8 +836,8 @@ def api_stock_summary():
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
+    # Admin / Sales: full view (optionally with q filter)
     if allowed is None:
-        # Admin / Sales: full view
         if q:
             cur.execute("""
                 SELECT category AS brand,
@@ -881,47 +855,75 @@ def api_stock_summary():
                 GROUP BY category
                 ORDER BY category
             """)
+        data = cur.fetchall() or []
+        conn.close()
+        data = convert_decimals(data)
+        return jsonify({"ok": True, "brands": data})
+
+    # Customer path
+    # If allowed exists but no clauses -> user has no permitted companies
+    if not allowed.get("clauses"):
+        conn.close()
+        return jsonify({"ok": True, "brands": []})
+
+    # ---- WHITELIST: brands we allow customers to see ----
+    # Use the display names list (you can edit this array if you want different brands)
+    CUSTOMER_ALLOWED_BRANDS = CUSTOMER_ALLOWED_COMPANY_DISPLAY[:]  # ['Novateur ...', 'elmeasure', 'socomec', 'kei']
+    # -----------------------------------------------------
+
+    # Build company where clause (e.g. "LOWER(company) = %s OR LOWER(company) LIKE %s ...")
+    company_where = " OR ".join(allowed["clauses"])
+    params = allowed["params"].copy()
+
+    # When 'q' is present, also allow searching inside the whitelist (we include q check)
+    # We'll filter by whitelist using IN (...) on normalized categories in SQL where possible.
+    # Because DB brand names may vary, we guard by matching category (exact) or category LIKE q if q provided.
+    # Prefer JOIN to stock_movements to ensure the brand actually has movements for permitted companies.
+    placeholders = ",".join(["%s"] * len(CUSTOMER_ALLOWED_BRANDS))
+
+    if q:
+        sql = f"""
+            SELECT i.category AS brand,
+                   SUM(i.opening_qty * i.opening_rate) AS value
+            FROM stock_items i
+            JOIN stock_movements m ON i.name = m.item
+            WHERE ({company_where})
+              AND i.category IN ({placeholders})
+              AND (i.category LIKE %s OR i.name LIKE %s)
+            GROUP BY i.category
+            ORDER BY i.category
+        """
+        params.extend(CUSTOMER_ALLOWED_BRANDS)
+        params.extend([f"%{q}%", f"%{q}%"])
     else:
-        # Customer: if allowed is present but there are no clauses -> no permitted companies -> return empty
-        if not allowed.get("clauses"):
-            conn.close()
-            # return empty brands list (ok==true so client knows no error)
-            return jsonify({"ok": True, "brands": []})
+        sql = f"""
+            SELECT i.category AS brand,
+                   SUM(i.opening_qty * i.opening_rate) AS value
+            FROM stock_items i
+            JOIN stock_movements m ON i.name = m.item
+            WHERE ({company_where})
+              AND i.category IN ({placeholders})
+            GROUP BY i.category
+            ORDER BY i.category
+        """
+        params.extend(CUSTOMER_ALLOWED_BRANDS)
 
-        # Customer: restrict brands to those that have stock_movements for allowed companies
-        company_where = " OR ".join(allowed["clauses"])
-        params = allowed["params"].copy()
+    # Execute with combined params
+    cur.execute(sql, tuple(params))
+    rows = cur.fetchall() or []
 
-        if q:
-            sql = f"""
-                SELECT i.category AS brand,
-                       SUM(i.opening_qty * i.opening_rate) AS value
-                FROM stock_items i
-                JOIN stock_movements m ON i.name = m.item
-                WHERE ({company_where})
-                  AND (i.category LIKE %s OR i.name LIKE %s)
-                GROUP BY i.category
-                ORDER BY i.category
-            """
-            params.extend([f"%{q}%", f"%{q}%"])
-        else:
-            sql = f"""
-                SELECT i.category AS brand,
-                       SUM(i.opening_qty * i.opening_rate) AS value
-                FROM stock_items i
-                JOIN stock_movements m ON i.name = m.item
-                WHERE ({company_where})
-                GROUP BY i.category
-                ORDER BY i.category
-            """
+    # If you want to *always* show the full whitelist even when a specific brand has no movements
+    # (i.e., show zeros), uncomment the block below. By default it is commented to only show brands
+    # that actually have movements for the customer's companies.
+    #
+    # if not rows:
+    #     # produce zero-value entries for each whitelist brand
+    #     rows = [{"brand": b, "value": 0} for b in CUSTOMER_ALLOWED_BRANDS]
 
-        cur.execute(sql, tuple(params))
-
-
-    data = cur.fetchall() or []
     conn.close()
-    data = convert_decimals(data)
+    data = convert_decimals(rows)
     return jsonify({"ok": True, "brands": data})
+
 
 
 # ---------------------------------------------------------
