@@ -872,9 +872,13 @@ def api_stock_summary():
     # HARD-CODED WHITELIST:
     BRAND_WHITELIST = [
         "Novateur Electrical & Digital Systems Pvt.Ltd",
-        "elmeasure",
-        "socomec",
-        "kei"
+        "Elmeasure",
+        "SOCOMEC",
+        "KEI"	
+        "KEI (100/180 METER)"
+        "KEI (CONFLAME)"
+        "KEI (HOMECAB)"
+
     ]
     # Normalize for matching in SQL (lower + trim)
     normalized = [b.lower().strip() for b in BRAND_WHITELIST]
