@@ -826,17 +826,16 @@ def api_sales_monthly(brand):
 def api_stock_summary():
     """
     Returns brands (categories) with aggregated value.
-    If user is a customer, restrict results to a small whitelist of brands
-    and apply company-based ACL (only brands that have movements for allowed companies).
+    For customer role we return only a hardcoded whitelist of brands (case-insensitive).
     """
     q = request.args.get("q", "").strip()
     user = g.user
-    allowed = get_allowed_filters_for_user(user)  # returns None or {'clauses':..., 'params':[...]} 
+    allowed = get_allowed_filters_for_user(user)  # None or {'clauses':..., 'params':[...]} 
 
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    # Admin / Sales: full view (optionally with q filter)
+    # Admin / Sales: full view (unchanged)
     if allowed is None:
         if q:
             cur.execute("""
@@ -866,34 +865,38 @@ def api_stock_summary():
         conn.close()
         return jsonify({"ok": True, "brands": []})
 
-    # ---- WHITELIST: brands we allow customers to see ----
-    # Use the display names list (you can edit this array if you want different brands)
-    CUSTOMER_ALLOWED_BRANDS = CUSTOMER_ALLOWED_COMPANY_DISPLAY[:]  # ['Novateur ...', 'elmeasure', 'socomec', 'kei']
-    # -----------------------------------------------------
+    # ---- HARD-CODED BRAND WHITELIST (edit these 4 names if needed) ----
+    BRAND_WHITELIST = [
+        "Novateur Electrical & Digital Systems Pvt.Ltd",
+        "elmeasure",
+        "socomec",
+        "kei"
+    ]
+    # Normalize the whitelist to lower-trim for SQL comparison
+    normalized_whitelist = [b.lower().strip() for b in BRAND_WHITELIST]
+    placeholders = ",".join(["%s"] * len(normalized_whitelist))
+    # ------------------------------------------------------------------
 
-    # Build company where clause (e.g. "LOWER(company) = %s OR LOWER(company) LIKE %s ...")
+    # Build company where clause (using the clauses returned by get_allowed_filters_for_user)
     company_where = " OR ".join(allowed["clauses"])
     params = allowed["params"].copy()
 
-    # When 'q' is present, also allow searching inside the whitelist (we include q check)
-    # We'll filter by whitelist using IN (...) on normalized categories in SQL where possible.
-    # Because DB brand names may vary, we guard by matching category (exact) or category LIKE q if q provided.
-    # Prefer JOIN to stock_movements to ensure the brand actually has movements for permitted companies.
-    placeholders = ",".join(["%s"] * len(CUSTOMER_ALLOWED_BRANDS))
-
+    # Build SQL: join to stock_movements to ensure brand had movements for permitted companies.
+    # We compare lower(trim(i.category)) IN (<normalized whitelist...>)
     if q:
+        # include q filter as well (search)
         sql = f"""
             SELECT i.category AS brand,
                    SUM(i.opening_qty * i.opening_rate) AS value
             FROM stock_items i
             JOIN stock_movements m ON i.name = m.item
             WHERE ({company_where})
-              AND i.category IN ({placeholders})
+              AND LOWER(TRIM(i.category)) IN ({placeholders})
               AND (i.category LIKE %s OR i.name LIKE %s)
             GROUP BY i.category
             ORDER BY i.category
         """
-        params.extend(CUSTOMER_ALLOWED_BRANDS)
+        params.extend(normalized_whitelist)
         params.extend([f"%{q}%", f"%{q}%"])
     else:
         sql = f"""
@@ -902,23 +905,20 @@ def api_stock_summary():
             FROM stock_items i
             JOIN stock_movements m ON i.name = m.item
             WHERE ({company_where})
-              AND i.category IN ({placeholders})
+              AND LOWER(TRIM(i.category)) IN ({placeholders})
             GROUP BY i.category
             ORDER BY i.category
         """
-        params.extend(CUSTOMER_ALLOWED_BRANDS)
+        params.extend(normalized_whitelist)
 
-    # Execute with combined params
     cur.execute(sql, tuple(params))
     rows = cur.fetchall() or []
 
-    # If you want to *always* show the full whitelist even when a specific brand has no movements
-    # (i.e., show zeros), uncomment the block below. By default it is commented to only show brands
-    # that actually have movements for the customer's companies.
+    # If you want to show all whitelist brands even when value==0 (force them),
+    # uncomment the block below. By default it's commented to only show brands that exist.
     #
     # if not rows:
-    #     # produce zero-value entries for each whitelist brand
-    #     rows = [{"brand": b, "value": 0} for b in CUSTOMER_ALLOWED_BRANDS]
+    #     rows = [{"brand": b, "value": 0} for b in BRAND_WHITELIST]
 
     conn.close()
     data = convert_decimals(rows)
