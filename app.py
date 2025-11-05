@@ -826,10 +826,10 @@ def api_sales_monthly(brand):
 def api_stock_summary():
     """
     Returns brands (categories) with aggregated value.
-    - Admin/sales: unchanged (full view).
-    - Customer: return exact hardcoded whitelist of brands (case-insensitive).
-      Values are aggregated from stock_items (opening_qty * opening_rate).
-      If a whitelist brand isn't present in stock_items, we still return it with value 0.
+    - Admin / Sales: unchanged (full view).
+    - Customer: return an exact hardcoded whitelist of brands (case-insensitive).
+      Each whitelist entry is returned with aggregated value from stock_items
+      (opening_qty * opening_rate). Missing brands are returned with value 0.
     """
     q = request.args.get("q", "").strip()
     user = g.user
@@ -868,32 +868,35 @@ def api_stock_summary():
         conn.close()
         return jsonify({"ok": True, "brands": []})
 
-    # ----------------------
-    # HARD-CODED WHITELIST:
+    # ---------------------------
+    # Exact whitelist you provided
+    # ---------------------------
     BRAND_WHITELIST = [
         "Novateur Electrical & Digital Systems Pvt.Ltd",
         "Elmeasure",
         "SOCOMEC",
-        "KEI"	
-        "KEI (100/180 METER)"
-        "KEI (CONFLAME)"
+        "KEI",
+        "KEI (100/180 METER)",
+        "KEI (CONFLAME)",
         "KEI (HOMECAB)"
-
     ]
-    # Normalize for matching in SQL (lower + trim)
-    normalized = [b.lower().strip() for b in BRAND_WHITELIST]
+    # ---------------------------
+
+    # Normalize helper
+    def n(s):
+        return (s or "").lower().strip()
+
+    normalized = [n(b) for b in BRAND_WHITELIST]
     placeholders = ",".join(["%s"] * len(normalized))
 
-    # DBG: helpful debug output (inspect server console)
+    # DBG info
     # ignore: avoid_print
-    print(f"DBG: api_stock_summary called for user={user.get('username')} role={user.get('role')}")
+    print(f"DBG: api_stock_summary called for user={user.get('username')} role={user.get('role')} q='{q}'")
     # ignore: avoid_print
     print(f"DBG: BRAND_WHITELIST(normalized) = {normalized}")
-    # ----------------------
 
-    # Query stock_items to compute values for whitelist (case-insensitive)
-    # We use LOWER(TRIM(category)) IN (...)
     try:
+        # Query aggregated values for any matching categories (case-insensitive exact match)
         sql = f"""
             SELECT TRIM(category) AS brand, SUM(opening_qty * opening_rate) AS value
             FROM stock_items
@@ -905,23 +908,25 @@ def api_stock_summary():
         rows = cur.fetchall() or []
         rows = convert_decimals(rows)
 
-        # Build a map brand_lower -> value
+        # Map normalized category -> value
         present = {}
         for r in rows:
-            # r['brand'] may be in original form; normalize key using lower().strip()
-            key = (r.get("brand") or "").lower().strip()
-            present[key] = float(r.get("value") or 0)
+            key = n(r.get("brand") or "")
+            present[key] = float(r.get("value") or 0.0)
 
-        # Ensure all whitelist brands appear (fill missing with 0)
+        # Ensure all whitelist brands are present in output (fill missing with 0)
         out = []
         for original in BRAND_WHITELIST:
-            k = original.lower().strip()
-            v = present.get(k, 0.0)
-            out.append({"brand": original, "value": v})
+            key = n(original)
+            value = present.get(key, 0.0)
+            out.append({"brand": original, "value": value})
+            # DBG each mapping
+            # ignore: avoid_print
+            print(f"DBG: brand_out -> '{original}' (norm='{key}') value={value}")
 
-        # If a free-form search 'q' was provided, we can further filter the out list by q:
+        # If a search q is present, optionally filter the out list by q substring match on brand
         if q:
-            ql = q.lower()
+            ql = q.lower().strip()
             out = [o for o in out if ql in o["brand"].lower()]
 
         conn.close()
@@ -929,12 +934,13 @@ def api_stock_summary():
     except Exception as e:
         # DBG
         # ignore: avoid_print
-        print(f"DBG: api_stock_summary - exception while querying whitelist: {e}")
+        print(f"DBG: api_stock_summary - exception: {e}")
         try:
             conn.close()
-        except:
+        except Exception:
             pass
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
