@@ -825,11 +825,9 @@ def api_sales_monthly(brand):
 @token_or_session_required
 def api_stock_summary():
     """
-    Unified debug-friendly stock-summary:
-    - For each brand we return:
-        { brand, value_from_items, value_from_movements, items_count, movements_count }
-    - Admin/sales: full set (all brands in stock_items).
-    - Customer: restricted to whitelist (case-insensitive match), or empty if no allowed companies.
+    Returns stock summary by brand.
+    - Admin/Sales: full list from stock_items.
+    - Customer: only the selected hardcoded brands.
     """
     q = request.args.get("q", "").strip()
     user = g.user
@@ -838,25 +836,15 @@ def api_stock_summary():
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    # Authoritative customer whitelist (edit as needed)
-    BRAND_WHITELIST = [
-        "Novateur Electrical & Digital Systems Pvt.Ltd",
-        "Elmeasure",
-        "SOCOMEC",
-        "KEI",
-        "KEI (100/180 METER)",
-        "KEI (CONFLAME)",
-        "KEI (HOMECAB)"
-    ]
-
-    def n(s): return (s or "").lower().strip()
-
     try:
-        # ---- Admin / Sales: list all brands from stock_items (optionally filtered by q) ----
+        # -------------------------------
+        # 🟢 Admin / Sales → full list
+        # -------------------------------
         if allowed is None:
             if q:
                 cur.execute("""
-                    SELECT TRIM(category) AS brand
+                    SELECT TRIM(category) AS brand,
+                           COALESCE(SUM(opening_qty * opening_rate), 0) AS value
                     FROM stock_items
                     WHERE category LIKE %s OR name LIKE %s
                     GROUP BY TRIM(category)
@@ -864,108 +852,50 @@ def api_stock_summary():
                 """, (f"%{q}%", f"%{q}%"))
             else:
                 cur.execute("""
-                    SELECT TRIM(category) AS brand
+                    SELECT TRIM(category) AS brand,
+                           COALESCE(SUM(opening_qty * opening_rate), 0) AS value
                     FROM stock_items
                     GROUP BY TRIM(category)
                     ORDER BY TRIM(category)
                 """)
-            brands_raw = [r.get("brand") for r in cur.fetchall() or []]
-        else:
-            # ---- Customer path: return whitelist intersection (or empty) ----
-            if not allowed.get("clauses"):
-                conn.close()
-                return jsonify({"ok": True, "brands": []})
-            # Use the whitelist, optionally filter by q
-            if q:
-                qw = q.lower().strip()
-                brands_raw = [b for b in BRAND_WHITELIST if qw in n(b)]
-            else:
-                brands_raw = list(BRAND_WHITELIST)
+            data = cur.fetchall() or []
+            conn.close()
+            return jsonify({"ok": True, "brands": convert_decimals(data)})
 
-        # Deduplicate / normalize order
-        # normalize lookup map: normalized->original
-        norm_to_orig = { n(b): b for b in brands_raw }
+        # -------------------------------
+        # 🟡 Customer → show only fixed brands
+        # -------------------------------
+        BRANDS = [
+            "Novateur Electrical & Digital Systems Pvt.Ltd",
+            "Elemeasure",
+            "SOCOMEC",
+            "KEI",
+            "KEI (100/180 METER)",
+            "KEI (CONFLAME)",
+            "KEI (HOMECAB)"
+        ]
 
-        # We'll compute per-brand stats. Use placeholders for SQL IN if needed.
+        # Prepare result list
         result = []
-        for brand_norm, brand_original in norm_to_orig.items():
-            # compute value_from_items and items_count
-            # match case-insensitively using LOWER(TRIM(category)) = %s OR LIKE-like match
-            # try exact normalized equals first, then fallback to LIKE
-            params_items = (brand_norm,)
+        for brand in BRANDS:
             cur.execute("""
-                SELECT 
-                  COALESCE(SUM(opening_qty * opening_rate), 0) AS value_from_items,
-                  COUNT(*) AS items_count
+                SELECT COALESCE(SUM(opening_qty * opening_rate), 0) AS value
                 FROM stock_items
-                WHERE LOWER(TRIM(category)) = %s
-            """, params_items)
-            r_items = cur.fetchone() or {}
-            # if no rows found (items_count == 0), try LIKE (covers slight variants)
-            items_count = int(r_items.get("items_count", 0) or 0)
-            value_from_items = float(r_items.get("value_from_items") or 0.0)
-
-            if items_count == 0:
-                cur.execute("""
-                    SELECT 
-                      COALESCE(SUM(opening_qty * opening_rate), 0) AS value_from_items,
-                      COUNT(*) AS items_count
-                    FROM stock_items
-                    WHERE LOWER(category) LIKE %s
-                """, (f"%{brand_norm}%",))
-                r_items2 = cur.fetchone() or {}
-                items_count = int(r_items2.get("items_count", 0) or 0)
-                value_from_items = float(r_items2.get("value_from_items") or 0.0)
-
-            # compute value_from_movements and movements_count (join stock_movements)
-            # Use move amounts aggregated for items whose category matches
-            cur.execute("""
-                SELECT 
-                  COALESCE(SUM(m.amount), 0) AS value_from_movements,
-                  COUNT(*) AS movements_count
-                FROM stock_movements m
-                JOIN stock_items i ON m.item = i.name
-                WHERE LOWER(TRIM(i.category)) = %s
-            """, (brand_norm,))
-            r_moves = cur.fetchone() or {}
-            movements_count = int(r_moves.get("movements_count", 0) or 0)
-            value_from_movements = float(r_moves.get("value_from_movements") or 0.0)
-
-            if movements_count == 0:
-                # fallback to LIKE if exact normalized category had no movements
-                cur.execute("""
-                    SELECT 
-                      COALESCE(SUM(m.amount), 0) AS value_from_movements,
-                      COUNT(*) AS movements_count
-                    FROM stock_movements m
-                    JOIN stock_items i ON m.item = i.name
-                    WHERE LOWER(i.category) LIKE %s
-                """, (f"%{brand_norm}%",))
-                r_moves2 = cur.fetchone() or {}
-                movements_count = int(r_moves2.get("movements_count", 0) or 0)
-                value_from_movements = float(r_moves2.get("value_from_movements") or 0.0)
-
-            # Assemble
-            result.append({
-                "brand": brand_original,
-                "brand_norm": brand_norm,
-                "value_from_items": value_from_items,
-                "items_count": items_count,
-                "value_from_movements": value_from_movements,
-                "movements_count": movements_count
-            })
-
-            # DBG prints (server log)
-            # ignore: avoid_print
-            print(f"DBG: brand='{brand_original}' norm='{brand_norm}' items_count={items_count} value_from_items={value_from_items} movements_count={movements_count} value_from_movements={value_from_movements}")
+                WHERE LOWER(TRIM(category)) = LOWER(TRIM(%s))
+            """, (brand,))
+            row = cur.fetchone()
+            val = float(row["value"]) if row and row.get("value") is not None else 0.0
+            result.append({"brand": brand, "value": val})
 
         conn.close()
         return jsonify({"ok": True, "brands": result})
+
     except Exception as e:
-        # ignore: avoid_print
-        print("DBG: api_stock_summary exception:", e)
-        try: conn.close()
-        except Exception: pass
+        print("api_stock_summary error:", e)
+        try:
+            conn.close()
+        except Exception:
+            pass
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
