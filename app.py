@@ -51,6 +51,20 @@ CUSTOMER_ALLOWED_COMPANY_DISPLAY = [
     "socomec",
     "kei"
 ]
+@app.route("/api/debug/dbtest")
+def dbtest():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT NOW();")
+        res = cur.fetchone()
+        conn.close()
+        return jsonify({"ok": True, "time": str(res[0])})
+    except Exception as e:
+        import traceback
+        print("❌ DBTEST ERROR:", traceback.format_exc())
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # ---------------------------
 # Helper: convert non-json-native types
