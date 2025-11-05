@@ -824,21 +824,14 @@ def api_sales_monthly(brand):
 @app.route("/api/stock-summary")
 @token_or_session_required
 def api_stock_summary():
-    """
-    Returns brands (categories) with aggregated value.
-    - Admin / Sales: unchanged (full view).
-    - Customer: return an exact hardcoded whitelist of brands (case-insensitive).
-      Each whitelist entry is returned with aggregated value from stock_items
-      (opening_qty * opening_rate). Missing brands are returned with value 0.
-    """
     q = request.args.get("q", "").strip()
     user = g.user
-    allowed = get_allowed_filters_for_user(user)  # None or {'clauses':..., 'params':[...]} 
+    allowed = get_allowed_filters_for_user(user)
 
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    # Admin / Sales path (unchanged)
+    # Admin / Sales: same aggregation as web HTML view
     if allowed is None:
         if q:
             cur.execute("""
@@ -862,15 +855,12 @@ def api_stock_summary():
         data = convert_decimals(data)
         return jsonify({"ok": True, "brands": data})
 
-    # Customer path
-    # If allowed exists but there are no clauses -> no permitted companies
+    # Customer: if no allowed clauses -> empty
     if not allowed.get("clauses"):
         conn.close()
         return jsonify({"ok": True, "brands": []})
 
-    # ---------------------------
-    # Exact whitelist you provided
-    # ---------------------------
+    # AUTHORITATIVE whitelist (use your exact names)
     BRAND_WHITELIST = [
         "Novateur Electrical & Digital Systems Pvt.Ltd",
         "Elmeasure",
@@ -880,69 +870,46 @@ def api_stock_summary():
         "KEI (CONFLAME)",
         "KEI (HOMECAB)"
     ]
-    # ---------------------------
 
     # Normalize helper
     def n(s):
         return (s or "").lower().strip()
 
-    normalized = [n(b) for b in BRAND_WHITELIST]
-    placeholders = ",".join(["%s"] * len(normalized))
-
-    # DBG info
-    # ignore: avoid_print
-    print(f"DBG: api_stock_summary called for user={user.get('username')} role={user.get('role')} q='{q}'")
-    # ignore: avoid_print
-    print(f"DBG: BRAND_WHITELIST(normalized) = {normalized}")
-
-    try:
-        # Query aggregated values for any matching categories (case-insensitive exact match)
-        sql = f"""
-            SELECT TRIM(category) AS brand, SUM(opening_qty * opening_rate) AS value
-            FROM stock_items
-            WHERE LOWER(TRIM(category)) IN ({placeholders})
-            GROUP BY LOWER(TRIM(category)), TRIM(category)
-            ORDER BY TRIM(category)
-        """
-        cur.execute(sql, tuple(normalized))
-        rows = cur.fetchall() or []
-        rows = convert_decimals(rows)
-
-        # Map normalized category -> value
-        present = {}
-        for r in rows:
-            key = n(r.get("brand") or "")
-            present[key] = float(r.get("value") or 0.0)
-
-        # Ensure all whitelist brands are present in output (fill missing with 0)
-        out = []
-        for original in BRAND_WHITELIST:
-            key = n(original)
-            value = present.get(key, 0.0)
-            out.append({"brand": original, "value": value})
-            # DBG each mapping
-            # ignore: avoid_print
-            print(f"DBG: brand_out -> '{original}' (norm='{key}') value={value}")
-
-        # If a search q is present, optionally filter the out list by q substring match on brand
+    out = []
+    for brand in BRAND_WHITELIST:
+        token = n(brand)
+        like_pattern = f"%{token}%"
         if q:
-            ql = q.lower().strip()
-            out = [o for o in out if ql in o["brand"].lower()]
+            sql = """
+                SELECT COALESCE(SUM(opening_qty * opening_rate), 0) AS value
+                FROM stock_items
+                WHERE LOWER(category) LIKE %s
+                  AND (category LIKE %s OR name LIKE %s)
+            """
+            params = (like_pattern, f"%{q}%", f"%{q}%")
+        else:
+            sql = """
+                SELECT COALESCE(SUM(opening_qty * opening_rate), 0) AS value
+                FROM stock_items
+                WHERE LOWER(category) LIKE %s
+            """
+            params = (like_pattern,)
 
-        conn.close()
-        return jsonify({"ok": True, "brands": out})
-    except Exception as e:
-        # DBG
-        # ignore: avoid_print
-        print(f"DBG: api_stock_summary - exception: {e}")
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return jsonify({"ok": False, "error": str(e)}), 500
+        cur.execute(sql, params)
+        row = cur.fetchone() or {}
+        # row may be dict or tuple depending on driver
+        val = 0.0
+        if isinstance(row, dict):
+            val = float(row.get("value") or 0)
+        else:
+            try:
+                val = float(row[0] or 0)
+            except Exception:
+                val = 0.0
+        out.append({"brand": brand, "value": val})
 
-
-
+    conn.close()
+    return jsonify({"ok": True, "brands": out})
 
 # ---------------------------------------------------------
 # 🟢 6️⃣ Items under Brand (2nd layer of stock)
