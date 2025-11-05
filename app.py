@@ -826,7 +826,10 @@ def api_sales_monthly(brand):
 def api_stock_summary():
     """
     Returns brands (categories) with aggregated value.
-    For customer role we return only a hardcoded whitelist of brands (case-insensitive).
+    - Admin/sales: unchanged (full view).
+    - Customer: return exact hardcoded whitelist of brands (case-insensitive).
+      Values are aggregated from stock_items (opening_qty * opening_rate).
+      If a whitelist brand isn't present in stock_items, we still return it with value 0.
     """
     q = request.args.get("q", "").strip()
     user = g.user
@@ -835,7 +838,7 @@ def api_stock_summary():
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    # Admin / Sales: full view (unchanged)
+    # Admin / Sales path (unchanged)
     if allowed is None:
         if q:
             cur.execute("""
@@ -860,69 +863,74 @@ def api_stock_summary():
         return jsonify({"ok": True, "brands": data})
 
     # Customer path
-    # If allowed exists but no clauses -> user has no permitted companies
+    # If allowed exists but there are no clauses -> no permitted companies
     if not allowed.get("clauses"):
         conn.close()
         return jsonify({"ok": True, "brands": []})
 
-    # ---- HARD-CODED BRAND WHITELIST (edit these 4 names if needed) ----
+    # ----------------------
+    # HARD-CODED WHITELIST:
     BRAND_WHITELIST = [
         "Novateur Electrical & Digital Systems Pvt.Ltd",
         "elmeasure",
         "socomec",
         "kei"
     ]
-    # Normalize the whitelist to lower-trim for SQL comparison
-    normalized_whitelist = [b.lower().strip() for b in BRAND_WHITELIST]
-    placeholders = ",".join(["%s"] * len(normalized_whitelist))
-    # ------------------------------------------------------------------
+    # Normalize for matching in SQL (lower + trim)
+    normalized = [b.lower().strip() for b in BRAND_WHITELIST]
+    placeholders = ",".join(["%s"] * len(normalized))
 
-    # Build company where clause (using the clauses returned by get_allowed_filters_for_user)
-    company_where = " OR ".join(allowed["clauses"])
-    params = allowed["params"].copy()
+    # DBG: helpful debug output (inspect server console)
+    # ignore: avoid_print
+    print(f"DBG: api_stock_summary called for user={user.get('username')} role={user.get('role')}")
+    # ignore: avoid_print
+    print(f"DBG: BRAND_WHITELIST(normalized) = {normalized}")
+    # ----------------------
 
-    # Build SQL: join to stock_movements to ensure brand had movements for permitted companies.
-    # We compare lower(trim(i.category)) IN (<normalized whitelist...>)
-    if q:
-        # include q filter as well (search)
+    # Query stock_items to compute values for whitelist (case-insensitive)
+    # We use LOWER(TRIM(category)) IN (...)
+    try:
         sql = f"""
-            SELECT i.category AS brand,
-                   SUM(i.opening_qty * i.opening_rate) AS value
-            FROM stock_items i
-            JOIN stock_movements m ON i.name = m.item
-            WHERE ({company_where})
-              AND LOWER(TRIM(i.category)) IN ({placeholders})
-              AND (i.category LIKE %s OR i.name LIKE %s)
-            GROUP BY i.category
-            ORDER BY i.category
+            SELECT TRIM(category) AS brand, SUM(opening_qty * opening_rate) AS value
+            FROM stock_items
+            WHERE LOWER(TRIM(category)) IN ({placeholders})
+            GROUP BY LOWER(TRIM(category)), TRIM(category)
+            ORDER BY TRIM(category)
         """
-        params.extend(normalized_whitelist)
-        params.extend([f"%{q}%", f"%{q}%"])
-    else:
-        sql = f"""
-            SELECT i.category AS brand,
-                   SUM(i.opening_qty * i.opening_rate) AS value
-            FROM stock_items i
-            JOIN stock_movements m ON i.name = m.item
-            WHERE ({company_where})
-              AND LOWER(TRIM(i.category)) IN ({placeholders})
-            GROUP BY i.category
-            ORDER BY i.category
-        """
-        params.extend(normalized_whitelist)
+        cur.execute(sql, tuple(normalized))
+        rows = cur.fetchall() or []
+        rows = convert_decimals(rows)
 
-    cur.execute(sql, tuple(params))
-    rows = cur.fetchall() or []
+        # Build a map brand_lower -> value
+        present = {}
+        for r in rows:
+            # r['brand'] may be in original form; normalize key using lower().strip()
+            key = (r.get("brand") or "").lower().strip()
+            present[key] = float(r.get("value") or 0)
 
-    # If you want to show all whitelist brands even when value==0 (force them),
-    # uncomment the block below. By default it's commented to only show brands that exist.
-    #
-    # if not rows:
-    #     rows = [{"brand": b, "value": 0} for b in BRAND_WHITELIST]
+        # Ensure all whitelist brands appear (fill missing with 0)
+        out = []
+        for original in BRAND_WHITELIST:
+            k = original.lower().strip()
+            v = present.get(k, 0.0)
+            out.append({"brand": original, "value": v})
 
-    conn.close()
-    data = convert_decimals(rows)
-    return jsonify({"ok": True, "brands": data})
+        # If a free-form search 'q' was provided, we can further filter the out list by q:
+        if q:
+            ql = q.lower()
+            out = [o for o in out if ql in o["brand"].lower()]
+
+        conn.close()
+        return jsonify({"ok": True, "brands": out})
+    except Exception as e:
+        # DBG
+        # ignore: avoid_print
+        print(f"DBG: api_stock_summary - exception while querying whitelist: {e}")
+        try:
+            conn.close()
+        except:
+            pass
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 
