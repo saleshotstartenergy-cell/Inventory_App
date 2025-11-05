@@ -837,7 +837,7 @@ def api_sales_monthly(brand):
 # ---------------------------------------------------------
 @app.route("/api/stock-summary")
 @token_or_session_required
-def api_stock_items(brand):
+def api_stock_summary(brand):
     """
     Return items under a brand.
     - Admin/Sales: full list from stock_items.
