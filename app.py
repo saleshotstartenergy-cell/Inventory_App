@@ -821,15 +821,15 @@ def api_sales_monthly(brand):
 # ---------------------------------------------------------
 # 🟢 5️⃣ Stock Summary (1st layer)
 # ---------------------------------------------------------
-@app.route("/api/stock-summary")
+@app.route("/api/stock-summary/<brand>")
 @token_or_session_required
-def api_stock_summary():
+def api_stock_items(brand):
     """
-    Returns stock summary by brand.
+    Return items under a brand.
     - Admin/Sales: full list from stock_items.
-    - Customer: only the selected hardcoded brands.
+    - Customer: only if brand is in the fixed allowed list (same 6 brands).
     """
-    q = request.args.get("q", "").strip()
+    decoded_brand = unquote_plus(brand or "").strip()
     user = g.user
     allowed = get_allowed_filters_for_user(user)
 
@@ -837,35 +837,8 @@ def api_stock_summary():
     cur = conn.cursor(dictionary=True)
 
     try:
-        # -------------------------------
-        # 🟢 Admin / Sales → full list
-        # -------------------------------
-        if allowed is None:
-            if q:
-                cur.execute("""
-                    SELECT TRIM(category) AS brand,
-                           COALESCE(SUM(opening_qty * opening_rate), 0) AS value
-                    FROM stock_items
-                    WHERE category LIKE %s OR name LIKE %s
-                    GROUP BY TRIM(category)
-                    ORDER BY TRIM(category)
-                """, (f"%{q}%", f"%{q}%"))
-            else:
-                cur.execute("""
-                    SELECT TRIM(category) AS brand,
-                           COALESCE(SUM(opening_qty * opening_rate), 0) AS value
-                    FROM stock_items
-                    GROUP BY TRIM(category)
-                    ORDER BY TRIM(category)
-                """)
-            data = cur.fetchall() or []
-            conn.close()
-            return jsonify({"ok": True, "brands": convert_decimals(data)})
-
-        # -------------------------------
-        # 🟡 Customer → show only fixed brands
-        # -------------------------------
-        BRANDS = [
+        # ✅ Allowed brand names for customer role
+        ALLOWED_BRANDS = [
             "Novateur Electrical & Digital Systems Pvt.Ltd",
             "Elemeasure",
             "SOCOMEC",
@@ -875,23 +848,57 @@ def api_stock_summary():
             "KEI (HOMECAB)"
         ]
 
-        # Prepare result list
-        result = []
-        for brand in BRANDS:
+        # 🟢 Admin / Sales: full list (same as before)
+        if allowed is None:
             cur.execute("""
-                SELECT COALESCE(SUM(opening_qty * opening_rate), 0) AS value
-                FROM stock_items
-                WHERE LOWER(TRIM(category)) = LOWER(TRIM(%s))
-            """, (brand,))
-            row = cur.fetchone()
-            val = float(row["value"]) if row and row.get("value") is not None else 0.0
-            result.append({"brand": brand, "value": val})
+                SELECT i.name AS item,
+                       i.opening_qty AS total_qty,
+                       IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                       (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                       MAX(r.reserved_by) AS reserved_by,
+                       DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
+                FROM stock_items i
+                LEFT JOIN stock_reservations r
+                  ON i.name = r.item AND r.status='ACTIVE'
+                WHERE TRIM(i.category) = TRIM(%s)
+                GROUP BY i.name, i.opening_qty
+                ORDER BY i.name
+            """, (decoded_brand,))
 
+        else:
+            # 🟡 Customer role
+            # Allow only the selected brands — others return empty
+            if decoded_brand not in ALLOWED_BRANDS:
+                conn.close()
+                return jsonify({"ok": True, "brand": decoded_brand, "items": []})
+
+            # Fetch items directly from stock_items (no company restriction)
+            cur.execute("""
+                SELECT i.name AS item,
+                       i.opening_qty AS total_qty,
+                       IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                       (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                       MAX(r.reserved_by) AS reserved_by,
+                       DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
+                FROM stock_items i
+                LEFT JOIN stock_reservations r
+                  ON i.name = r.item AND r.status='ACTIVE'
+                WHERE TRIM(i.category) = TRIM(%s)
+                GROUP BY i.name, i.opening_qty
+                ORDER BY i.name
+            """, (decoded_brand,))
+
+        rows = cur.fetchall() or []
         conn.close()
-        return jsonify({"ok": True, "brands": result})
+
+        return jsonify({
+            "ok": True,
+            "brand": decoded_brand,
+            "items": convert_decimals(rows)
+        })
 
     except Exception as e:
-        print("api_stock_summary error:", e)
+        print("api_stock_items error:", e)
         try:
             conn.close()
         except Exception:
