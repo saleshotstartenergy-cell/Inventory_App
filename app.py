@@ -835,7 +835,7 @@ def api_sales_monthly(brand):
 # ---------------------------------------------------------
 # 🟢 5️⃣ Stock Summary (1st layer)
 # ---------------------------------------------------------
-@app.route("/api/stock-summary/<brand>")
+@app.route("/api/stock-summary")
 @token_or_session_required
 def api_stock_items(brand):
     """
