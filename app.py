@@ -905,14 +905,15 @@ def api_stock_summary():
         return jsonify({"ok": True, "brands": result})
 
     except Exception as e:
+        # safer error message to client; full traceback goes to logs
+        import traceback
         print("api_stock_summary error:", e)
+        print(traceback.format_exc())
         try:
             conn.close()
         except Exception:
             pass
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
+        return jsonify({"ok": False, "error": "Internal server error"}), 500
 
 
 # ---------------------------------------------------------
