@@ -279,7 +279,7 @@ def dashboard():
         return redirect(url_for("login"))
     return render_template("dashboard.html", user=session["user"], role=session["role"])
 
-@app.route("/search")
+'''@app.route("/search")
 def search():
     query = request.args.get("q", "").strip()
     if not query:
@@ -303,7 +303,7 @@ def search():
     results = cur.fetchall()
     conn.close()
     return render_template("search_results.html", query=query, results=results)
-
+'''
 @app.context_processor
 def inject_globals():
     return {'datetime': datetime, 'timedelta': timedelta}
