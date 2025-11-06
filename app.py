@@ -1033,29 +1033,58 @@ def api_stock_items(brand):
 
 
 # ---------------------------------------------------------
-# 🟢 7️⃣ Search Endpoint
+# 🟢 7️⃣ Search Endpoint 
 # ---------------------------------------------------------
 @app.route("/api/search")
 def api_search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"ok": True, "results": []})
+
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
-    cur.execute("""
-        SELECT 
-            name, category, base_unit,
-            opening_qty, opening_rate,
-            (opening_qty * opening_rate) AS value
-        FROM stock_items
-        WHERE name LIKE %s OR category LIKE %s
-        ORDER BY category, name
-        LIMIT 50
-    """, (f"%{q}%", f"%{q}%"))
-    results = cur.fetchall()
-    conn.close()
-    results = convert_decimals(results)
+    try:
+        like = f"%{q}%"
+        cur.execute("""
+            SELECT
+                i.name AS item,
+                i.name AS name,
+                i.category,
+                i.base_unit,
+                i.opening_qty AS total_qty,
+                IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                MAX(r.reserved_by) AS reserved_by,
+                DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS reserve_until,
+                (i.opening_qty * COALESCE(i.opening_rate, 0)) AS value
+            FROM stock_items i
+            LEFT JOIN stock_reservations r
+              ON r.item = i.name
+              AND r.status = 'ACTIVE'
+              AND (r.end_date IS NULL OR r.end_date >= CURDATE())
+            WHERE i.name LIKE %s OR i.category LIKE %s
+            GROUP BY i.id, i.name, i.category, i.base_unit, i.opening_qty, i.opening_rate
+            ORDER BY i.category, i.name
+        """, (like, like))
+
+        results = cur.fetchall() or []
+        results = convert_decimals(results)
+
+        # Ensure numeric defaults and consistent keys for client
+        for row in results:
+            row['total_qty'] = row.get('total_qty') or 0
+            row['reserved_qty'] = row.get('reserved_qty') or 0
+            row['available_qty'] = row.get('available_qty') or max(0, (row['total_qty'] - row['reserved_qty']))
+            # keep both 'item' and 'name' for compatibility
+            if 'name' not in row and 'item' in row:
+                row['name'] = row['item']
+
+    finally:
+        cur.close()
+        conn.close()
+
     return jsonify({"ok": True, "results": results})
+
 
 # ---------------------------
 # Custom INR filter (template filter)
