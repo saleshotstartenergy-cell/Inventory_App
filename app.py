@@ -1055,7 +1055,7 @@ def api_search():
                 IFNULL(SUM(r.qty), 0) AS reserved_qty,
                 (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
                 MAX(r.reserved_by) AS reserved_by,
-                DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS reserve_until,
+                DATE_FORMAT(MAX(r.end_date), '%d-%m-%y') AS reserve_until,
                 (i.opening_qty * COALESCE(i.opening_rate, 0)) AS value
             FROM stock_items i
             LEFT JOIN stock_reservations r
