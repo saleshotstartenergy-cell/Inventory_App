@@ -1097,13 +1097,13 @@ def api_stock_reserve():
       "item": "Item Name",
       "qty": 5,
       "days": 3,
-      "reserved_by": "sales"   # optional, if omitted we use session user or 'mobile'
+      "reserved_by": "username"
     }
+    Returns aggregates so Flutter can update UI instantly.
     """
     data = request.get_json() or {}
     item = data.get("item")
     try:
-        # qty might be string; validate and coerce
         qty = float(data.get("qty", 0))
     except Exception:
         return jsonify({"ok": False, "error": "Invalid qty"}), 400
@@ -1115,32 +1115,98 @@ def api_stock_reserve():
         return jsonify({"ok": False, "error": "Missing or invalid item/qty"}), 400
 
     end_date = date.today() + timedelta(days=days)
-
+    conn = None
     try:
         conn = get_connection()
-        cur = conn.cursor()
+        cur = conn.cursor(dictionary=True)
+
+        # ✅ Step 1: calculate current available quantity
+        cur.execute("""
+            SELECT 
+                i.name,
+                i.opening_qty AS total_qty,
+                IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty
+            FROM stock_items i
+            LEFT JOIN stock_reservations r 
+                ON r.item = i.name 
+               AND r.status='ACTIVE'
+               AND (r.end_date IS NULL OR r.end_date >= CURDATE())
+            WHERE i.name=%s
+            GROUP BY i.name, i.opening_qty
+        """, (item,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": f"Item '{item}' not found"}), 404
+
+        total_qty = float(row["total_qty"] or 0)
+        reserved_qty = float(row["reserved_qty"] or 0)
+        available_qty = max(0.0, total_qty - reserved_qty)
+
+        # ✅ Step 2: prevent over-reservation
+        if qty > available_qty:
+            return jsonify({
+                "ok": False,
+                "error": f"Only {available_qty} available; cannot reserve {qty}"
+            }), 400
+
+        # ✅ Step 3: insert reservation
         cur.execute("""
             INSERT INTO stock_reservations (item, reserved_by, qty, start_date, end_date, status)
             VALUES (%s, %s, %s, CURDATE(), %s, 'ACTIVE')
         """, (item, reserved_by, qty, end_date))
         conn.commit()
-        conn.close()
 
-        # send notification (best-effort)
+        # ✅ Step 4: recalc aggregates after insert
+        cur.execute("""
+            SELECT 
+                i.name AS item,
+                i.opening_qty AS total_qty,
+                IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                MAX(r.reserved_by) AS reserved_by,
+                DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS reserve_until
+            FROM stock_items i
+            LEFT JOIN stock_reservations r 
+                ON r.item = i.name 
+               AND r.status='ACTIVE'
+               AND (r.end_date IS NULL OR r.end_date >= CURDATE())
+            WHERE i.name=%s
+            GROUP BY i.name, i.opening_qty
+        """, (item,))
+        agg = cur.fetchone() or {}
+
+        # ✅ Step 5: send email notification (non-blocking)
         try:
             send_reservation_notification(item, qty, reserved_by, end_date)
         except Exception as e:
-            # don't fail the operation if email fails; just log
-            print("Reservation created but email failed:", e)
+            print("Reservation created but email send failed:", e)
 
-        return jsonify({"ok": True, "msg": "Reserved", "item": item, "qty": qty, "end_date": str(end_date)})
+        # ✅ Step 6: optional - real-time push (if SSE/WebSocket added)
+        # publish_reservation_event({"item": item, "aggregates": agg})
+
+        return jsonify({
+            "ok": True,
+            "msg": "Reserved successfully",
+            "reservation": {
+                "item": item,
+                "qty": qty,
+                "end_date": str(end_date),
+                "reserved_by": reserved_by,
+            },
+            "aggregates": convert_decimals(agg)
+        })
+
     except Exception as e:
-        # catch DB errors
-        try:
-            conn.close()
-        except Exception:
-            pass
+        import traceback
+        print("api_stock_reserve error:", e)
+        print(traceback.format_exc())
+        if conn:
+            conn.rollback()
         return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 # ---------------------------
