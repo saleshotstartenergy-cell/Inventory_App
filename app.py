@@ -1089,17 +1089,11 @@ def api_search():
 # ---------------------------
 # 🟢 API: stock reservation (from Flutter)
 # ---------------------------
+
 @app.route("/api/stock-reserve", methods=["POST"])
 def api_stock_reserve():
     """
-    Expected JSON body:
-    {
-      "item": "Item Name",
-      "qty": 5,
-      "days": 3,
-      "reserved_by": "username"
-    }
-    Returns aggregates so Flutter can update UI instantly.
+    Atomic reservation: uses a transaction + SELECT ... FOR UPDATE to avoid races.
     """
     data = request.get_json() or {}
     item = data.get("item")
@@ -1118,46 +1112,46 @@ def api_stock_reserve():
     conn = None
     try:
         conn = get_connection()
+        # Ensure we control transaction boundaries
+        conn.start_transaction()
         cur = conn.cursor(dictionary=True)
 
-        # ✅ Step 1: calculate current available quantity
+        # Lock the stock_items row for this item to prevent concurrent readers/writers.
         cur.execute("""
-            SELECT 
-                i.name,
-                i.opening_qty AS total_qty,
-                IFNULL(SUM(r.qty), 0) AS reserved_qty,
-                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty
+            SELECT i.name, i.opening_qty
             FROM stock_items i
-            LEFT JOIN stock_reservations r 
-                ON r.item = i.name 
-               AND r.status='ACTIVE'
-               AND (r.end_date IS NULL OR r.end_date >= CURDATE())
-            WHERE i.name=%s
-            GROUP BY i.name, i.opening_qty
+            WHERE i.name = %s
+            FOR UPDATE
         """, (item,))
-        row = cur.fetchone()
-        if not row:
+        item_row = cur.fetchone()
+        if not item_row:
+            conn.rollback()
             return jsonify({"ok": False, "error": f"Item '{item}' not found"}), 404
 
-        total_qty = float(row["total_qty"] or 0)
-        reserved_qty = float(row["reserved_qty"] or 0)
+        total_qty = float(item_row.get("opening_qty") or 0)
+
+        # Sum active reservations (inside same transaction) to compute available
+        cur.execute("""
+            SELECT IFNULL(SUM(r.qty), 0) AS reserved_qty
+            FROM stock_reservations r
+            WHERE r.item = %s AND r.status='ACTIVE' AND (r.end_date IS NULL OR r.end_date >= CURDATE())
+            FOR UPDATE
+        """, (item,))
+        sum_row = cur.fetchone()
+        reserved_qty = float(sum_row.get("reserved_qty") or 0)
         available_qty = max(0.0, total_qty - reserved_qty)
 
-        # ✅ Step 2: prevent over-reservation
         if qty > available_qty:
-            return jsonify({
-                "ok": False,
-                "error": f"Only {available_qty} available; cannot reserve {qty}"
-            }), 400
+            conn.rollback()
+            return jsonify({"ok": False, "error": f"Only {available_qty} available; cannot reserve {qty}"}), 400
 
-        # ✅ Step 3: insert reservation
+        # Insert the reservation (still inside transaction)
         cur.execute("""
             INSERT INTO stock_reservations (item, reserved_by, qty, start_date, end_date, status)
             VALUES (%s, %s, %s, CURDATE(), %s, 'ACTIVE')
         """, (item, reserved_by, qty, end_date))
-        conn.commit()
 
-        # ✅ Step 4: recalc aggregates after insert
+        # Recalculate aggregates for response (still inside transaction)
         cur.execute("""
             SELECT 
                 i.name AS item,
@@ -1167,23 +1161,21 @@ def api_stock_reserve():
                 MAX(r.reserved_by) AS reserved_by,
                 DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS reserve_until
             FROM stock_items i
-            LEFT JOIN stock_reservations r 
-                ON r.item = i.name 
-               AND r.status='ACTIVE'
-               AND (r.end_date IS NULL OR r.end_date >= CURDATE())
-            WHERE i.name=%s
+            LEFT JOIN stock_reservations r
+              ON r.item = i.name AND r.status='ACTIVE' AND (r.end_date IS NULL OR r.end_date >= CURDATE())
+            WHERE i.name = %s
             GROUP BY i.name, i.opening_qty
         """, (item,))
         agg = cur.fetchone() or {}
 
-        # ✅ Step 5: send email notification (non-blocking)
+        # Commit the transaction so other concurrent requests can proceed
+        conn.commit()
+
+        # Send email after commit (non-blocking best-effort)
         try:
             send_reservation_notification(item, qty, reserved_by, end_date)
         except Exception as e:
-            print("Reservation created but email send failed:", e)
-
-        # ✅ Step 6: optional - real-time push (if SSE/WebSocket added)
-        # publish_reservation_event({"item": item, "aggregates": agg})
+            print("Reservation created but email failed:", e)
 
         return jsonify({
             "ok": True,
@@ -1199,14 +1191,20 @@ def api_stock_reserve():
 
     except Exception as e:
         import traceback
-        print("api_stock_reserve error:", e)
+        print("api_stock_reserve (atomic) error:", e)
         print(traceback.format_exc())
         if conn:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ---------------------------
