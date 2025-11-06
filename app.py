@@ -1085,112 +1085,9 @@ def api_search():
 
     return jsonify({"ok": True, "results": results})
 
+
 # ---------------------------
 # 🟢 API: stock reservation (from Flutter)
-# ---------------------------
-@app.route("/api/stock-reserve", methods=["POST"])
-def api_stock_reserve():
-    """
-    Creates a reservation and returns the updated aggregates for that item.
-    """
-    data = request.get_json() or {}
-    item = data.get("item")
-    try:
-        qty = float(data.get("qty", 0))
-    except Exception:
-        return jsonify({"ok": False, "error": "Invalid qty"}), 400
-
-    days = int(data.get("days", 3)) if data.get("days") is not None else 3
-    reserved_by = data.get("reserved_by") or session.get("user") or "mobile"
-
-    if not item or qty <= 0:
-        return jsonify({"ok": False, "error": "Missing or invalid item/qty"}), 400
-
-    end_date = date.today() + timedelta(days=days)
-
-    conn = None
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO stock_reservations (item, reserved_by, qty, start_date, end_date, status)
-            VALUES (%s, %s, %s, CURDATE(), %s, 'ACTIVE')
-        """, (item, reserved_by, qty, end_date))
-        conn.commit()
-
-        # Return up-to-date aggregates for this item
-        cur.execute("""
-            SELECT
-                i.name AS item,
-                i.opening_qty AS total_qty,
-                IFNULL(SUM(r.qty), 0) AS reserved_qty,
-                (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
-                MAX(r.reserved_by) AS reserved_by,
-                DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS reserve_until
-            FROM stock_items i
-            LEFT JOIN stock_reservations r
-              ON r.item = i.name AND r.status='ACTIVE' AND (r.end_date IS NULL OR r.end_date >= CURDATE())
-            WHERE i.name = %s
-            GROUP BY i.name, i.opening_qty
-        """, (item,))
-        agg = cur.fetchone() or {}
-        agg = convert_decimals(agg)
-
-        # best-effort notify
-        try:
-            send_reservation_notification(item, qty, reserved_by, end_date)
-        except Exception as e:
-            print("Reservation created but notification failed:", e)
-
-        # Optionally publish push event here (SSE/WebSocket) if you implement it
-
-        return jsonify({"ok": True, "msg": "Reserved", "reservation": {"item": item, "qty": qty, "end_date": str(end_date)}, "aggregates": agg})
-    except Exception as e:
-        try:
-            if conn:
-                conn.rollback()
-        except Exception:
-            pass
-        import traceback
-        print("api_stock_reserve error:", e)
-        print(traceback.format_exc())
-        return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-
-
-# ---------------------------
-# Custom INR filter (template filter)
-# ---------------------------
-@app.template_filter("inr")
-def inr_format(value):
-    """Format number in Indian currency style like ₹12,34,567.89"""
-    try:
-        value = float(value)
-    except (ValueError, TypeError):
-        return value
-
-    # Split integer and decimal part
-    s = f"{value:.2f}"
-    if "." in s:
-        int_part, dec_part = s.split(".")
-    else:
-        int_part, dec_part = s, ""
-
-    # Indian grouping (last 3 digits, then 2-2)
-    if len(int_part) > 3:
-        int_part = int_part[-3:] if len(int_part) <= 3 else (
-            ",".join([int_part[:-3][::-1][i:i+2][::-1] for i in range(0, len(int_part[:-3]), 2)][::-1]) + "," + int_part[-3:]
-        )
-
-    return f"₹{int_part}.{dec_part}"
-# ---------------------------
-# 🟢 API: Create a stock reservation (from Flutter)
 # ---------------------------
 @app.route("/api/stock-reserve", methods=["POST"])
 def api_stock_reserve():
@@ -1244,6 +1141,34 @@ def api_stock_reserve():
         except Exception:
             pass
         return jsonify({"ok": False, "error": f"DB error: {e}"}), 500
+
+
+# ---------------------------
+# Custom INR filter (template filter)
+# ---------------------------
+@app.template_filter("inr")
+def inr_format(value):
+    """Format number in Indian currency style like ₹12,34,567.89"""
+    try:
+        value = float(value)
+    except (ValueError, TypeError):
+        return value
+
+    # Split integer and decimal part
+    s = f"{value:.2f}"
+    if "." in s:
+        int_part, dec_part = s.split(".")
+    else:
+        int_part, dec_part = s, ""
+
+    # Indian grouping (last 3 digits, then 2-2)
+    if len(int_part) > 3:
+        int_part = int_part[-3:] if len(int_part) <= 3 else (
+            ",".join([int_part[:-3][::-1][i:i+2][::-1] for i in range(0, len(int_part[:-3]), 2)][::-1]) + "," + int_part[-3:]
+        )
+
+    return f"₹{int_part}.{dec_part}"
+
     
 @app.route("/api/me")
 @token_or_session_required
