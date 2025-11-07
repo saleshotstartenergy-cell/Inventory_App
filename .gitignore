@@ -6,4 +6,5 @@ __pycache__/
 .idea/
 .vscode/
 tally_gateway.py
+etl_pipeline.py
 etl/
