@@ -434,23 +434,22 @@ def sales_brands():
     if q:
         cur.execute("""
             SELECT 
-                TRIM(IFNULL(i.category, 'Uncategorized')) AS name,
+                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
                 SUM(m.amount) AS value
             FROM stock_movements m
-            JOIN stock_items i ON m.item = i.name
-            WHERE m.movement_type='OUT' AND i.category LIKE %s
-            GROUP BY i.category
+            WHERE m.movement_type = 'OUT'
+              AND LOWER(TRIM(m.company)) LIKE %s
+            GROUP BY m.company
             ORDER BY value DESC
         """, (f"%{q}%",))
     else:
         cur.execute("""
             SELECT 
-                TRIM(IFNULL(i.category, 'Uncategorized')) AS name,
+                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
                 SUM(m.amount) AS value
             FROM stock_movements m
-            JOIN stock_items i ON m.item = i.name
-            WHERE m.movement_type='OUT'
-            GROUP BY i.category
+            WHERE m.movement_type = 'OUT'
+            GROUP BY m.company
             ORDER BY value DESC
         """)
 
@@ -472,10 +471,8 @@ def sales_monthly(brand):
             DATE_FORMAT(m.date, '%Y-%m') AS sort_key,
             SUM(m.amount) AS value
         FROM stock_movements m
-        JOIN stock_items i ON m.item = i.name
-        WHERE m.movement_type='OUT' AND TRIM(i.category)=TRIM(%s)
-        GROUP BY sort_key, month
-        ORDER BY sort_key
+        WHERE m.movement_type = 'OUT'
+          AND LOWER(TRIM(m.company)) = LOWER(TRIM(%s))
     """, (brand,))
 
     months = cur.fetchall() or []
