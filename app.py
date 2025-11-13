@@ -726,67 +726,63 @@ def api_sales_summary():
 # ---------------------------------------------------------
 @app.route("/api/sales-summary/brands")
 def api_sales_brands():
-    q = request.args.get("q", "").strip()
+    q = request.args.get("q", "").strip().lower()
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
     if q:
         cur.execute("""
             SELECT 
-                TRIM(IFNULL(i.category, 'Uncategorized')) AS brand,
+                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
                 SUM(m.amount) AS value
             FROM stock_movements m
-            JOIN stock_items i ON m.item = i.name
-            WHERE m.movement_type='OUT' AND i.category LIKE %s
-            GROUP BY i.category
+            WHERE m.movement_type = 'OUT'
+              AND LOWER(TRIM(m.company)) LIKE %s
+            GROUP BY m.company
             ORDER BY value DESC
         """, (f"%{q}%",))
     else:
         cur.execute("""
             SELECT 
-                TRIM(IFNULL(i.category, 'Uncategorized')) AS brand,
+                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
                 SUM(m.amount) AS value
             FROM stock_movements m
-            JOIN stock_items i ON m.item = i.name
-            WHERE m.movement_type='OUT'
-            GROUP BY i.category
+            WHERE m.movement_type = 'OUT'
+            GROUP BY m.company
             ORDER BY value DESC
         """)
 
-    data = cur.fetchall()
+    data = convert_decimals(cur.fetchall())
     conn.close()
-    data = convert_decimals(data)
     return jsonify({"ok": True, "brands": data})
+
 
 # ---------------------------------------------------------
 # 🟢 4️⃣ Monthly Sales for Brand (3rd layer)
 # ---------------------------------------------------------
 @app.route("/api/sales-summary/brands/<path:brand>")
 def api_sales_monthly(brand):
-    # decode the incoming path parameter (safer)
-    decoded_brand = unquote_plus(brand or "")
-    # optional year filter from query param (e.g. ?year=2025)
+    decoded_brand = unquote_plus(brand or "").strip()
     year_arg = request.args.get("year", "").strip()
+
     year = None
     try:
         if year_arg:
             year = int(year_arg)
-    except Exception:
+    except:
         year = None
 
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    # Build SQL with optional year filter
     sql = """
         SELECT 
             DATE_FORMAT(m.date, '%M %Y') AS month,
             DATE_FORMAT(m.date, '%Y-%m') AS sort_key,
             SUM(m.amount) AS value
         FROM stock_movements m
-        JOIN stock_items i ON m.item = i.name
         WHERE m.movement_type = 'OUT'
-          AND LOWER(TRIM(i.category)) = LOWER(TRIM(%s))
+          AND LOWER(TRIM(m.company)) = LOWER(TRIM(%s))
     """
     params = [decoded_brand]
 
@@ -797,31 +793,27 @@ def api_sales_monthly(brand):
     sql += " GROUP BY sort_key, month ORDER BY sort_key"
 
     cur.execute(sql, tuple(params))
-    data = cur.fetchall()
-    data = convert_decimals(data)
+    data = convert_decimals(cur.fetchall())
 
-    # If monthly rows are empty, also provide a brand-level total (helpful client-side)
+    # Provide total if monthly list empty
     total = None
     if not data:
         total_sql = """
             SELECT SUM(m.amount) AS total
             FROM stock_movements m
-            JOIN stock_items i ON m.item = i.name
             WHERE m.movement_type = 'OUT'
-              AND LOWER(TRIM(i.category)) = LOWER(TRIM(%s))
+              AND LOWER(TRIM(m.company)) = LOWER(TRIM(%s))
         """
         tparams = [decoded_brand]
-        # optionally respect year when computing total if you prefer
-        # If you want total restricted to same year, uncomment the following:
+
         if year is not None:
             total_sql += " AND YEAR(m.date) = %s"
             tparams.append(year)
 
         cur.execute(total_sql, tuple(tparams))
-        tr = cur.fetchone()
-        if tr and tr.get("total") is not None:
-            # convert Decimal -> float if needed (your convert_decimals may already do this)
-            total = float(tr["total"])
+        r = cur.fetchone()
+        if r and r.get("total") is not None:
+            total = float(r["total"])
 
     cur.close()
     conn.close()
@@ -829,8 +821,8 @@ def api_sales_monthly(brand):
     resp = {"ok": True, "brand": decoded_brand, "months": data}
     if total is not None:
         resp["total"] = total
-
     return jsonify(resp)
+
 
 # ---------------------------------------------------------
 # 🟢 5️⃣ Stock Summary (1st layer)

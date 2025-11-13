@@ -156,7 +156,7 @@ def stock_items():
 @app.route("/stock_movements")
 def stock_movements():
     q = """
-        SELECT $_LastSaleDate, $_LastSaleParty, $StockItemName, $_LastSalePrice, $_OutwardQuantity, $_OutwardValue
+        SELECT $_LastSaleDate, $PriceLevel, $StockItemName, $_LastSalePrice, $_OutwardQuantity, $_OutwardValue
         FROM VchStockItem
     """
     try:
