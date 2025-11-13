@@ -14,6 +14,7 @@ from functools import wraps
 from flask import g
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
+import logging
 
 # Load env vars
 load_dotenv()
@@ -829,8 +830,8 @@ def api_sales_monthly(brand):
 def api_stock_summary():
     """
     Returns stock summary by brand.
-    - Admin/Sales: full list from stock_items.
-    - Customer: only the selected hardcoded brands.
+    - Admin/Sales: full list from stock_items (grouped by brand)
+    - Customer: only the selected hardcoded brands (brand column used)
     """
     q = request.args.get("q", "").strip()
     user = g.user
@@ -840,26 +841,30 @@ def api_stock_summary():
     cur = conn.cursor(dictionary=True)
 
     try:
+        # Use brand if available, otherwise fall back to category
+        brand_expr = "TRIM(COALESCE(NULLIF(i.brand, ''), i.category))"
+
         # -------------------------------
         # 🟢 Admin / Sales → full list
         # -------------------------------
         if allowed is None:
             if q:
-                cur.execute("""
-                    SELECT TRIM(category) AS brand,
-                           COALESCE(SUM(opening_qty * opening_rate), 0) AS value
-                    FROM stock_items
-                    WHERE category LIKE %s OR name LIKE %s
-                    GROUP BY TRIM(category)
-                    ORDER BY TRIM(category)
-                """, (f"%{q}%", f"%{q}%"))
+                like_q = f"%{q}%"
+                cur.execute(f"""
+                    SELECT {brand_expr} AS brand,
+                           COALESCE(SUM(i.opening_qty * i.opening_rate), 0) AS value
+                    FROM stock_items i
+                    WHERE {brand_expr} LIKE %s OR i.name LIKE %s
+                    GROUP BY {brand_expr}
+                    ORDER BY {brand_expr}
+                """, (like_q, like_q))
             else:
-                cur.execute("""
-                    SELECT TRIM(category) AS brand,
-                           COALESCE(SUM(opening_qty * opening_rate), 0) AS value
-                    FROM stock_items
-                    GROUP BY TRIM(category)
-                    ORDER BY TRIM(category)
+                cur.execute(f"""
+                    SELECT {brand_expr} AS brand,
+                           COALESCE(SUM(i.opening_qty * i.opening_rate), 0) AS value
+                    FROM stock_items i
+                    GROUP BY {brand_expr}
+                    ORDER BY {brand_expr}
                 """)
             data = cur.fetchall() or []
             conn.close()
@@ -878,13 +883,12 @@ def api_stock_summary():
             "KEI (HOMECAB)"
         ]
 
-        # Prepare result list
         result = []
         for brand in BRANDS:
-            cur.execute("""
-                SELECT COALESCE(SUM(opening_qty * opening_rate), 0) AS value
-                FROM stock_items
-                WHERE LOWER(TRIM(category)) = LOWER(TRIM(%s))
+            cur.execute(f"""
+                SELECT COALESCE(SUM(i.opening_qty * i.opening_rate), 0) AS value
+                FROM stock_items i
+                WHERE LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category))) = LOWER(TRIM(%s))
             """, (brand,))
             row = cur.fetchone()
             val = float(row["value"]) if row and row.get("value") is not None else 0.0
@@ -894,10 +898,8 @@ def api_stock_summary():
         return jsonify({"ok": True, "brands": result})
 
     except Exception as e:
-        # safer error message to client; full traceback goes to logs
         import traceback
-        print("api_stock_summary error:", e)
-        print(traceback.format_exc())
+        logging.exception("api_stock_summary error: %s", e)
         try:
             conn.close()
         except Exception:
@@ -911,12 +913,6 @@ def api_stock_summary():
 @app.route("/api/stock-summary/<path:brand>")
 @token_or_session_required
 def api_stock_items(brand):
-    """
-    Return items under a brand.
-    - Admin/sales: full list (no company restriction)
-    - Customer: if brand is one of the fixed allowed brands, return items from stock_items.
-                Otherwise fallback to company-filtered join (may return empty).
-    """
     decoded_brand = unquote_plus(brand or "").strip()
     user = g.user
     allowed = get_allowed_filters_for_user(user)
@@ -925,45 +921,12 @@ def api_stock_items(brand):
     cur = conn.cursor(dictionary=True)
 
     try:
-        # Admin / sales -> full list (unchanged)
+        brand_expr = "LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category)))"
+        decoded_norm = decoded_brand.lower().strip()
+
+        # Admin / sales -> full list (unchanged except brand_expr)
         if allowed is None:
-            cur.execute("""
-                SELECT i.name AS item,
-                       i.opening_qty AS total_qty,
-                       IFNULL(SUM(r.qty), 0) AS reserved_qty,
-                       (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
-                       MAX(r.reserved_by) AS reserved_by,
-                       DATE_FORMAT(MAX(r.end_date), '%d-%m-%Y') AS end_date
-                FROM stock_items i
-                LEFT JOIN stock_reservations r
-                  ON i.name = r.item AND r.status='ACTIVE'
-                WHERE TRIM(i.category) = TRIM(%s)
-                GROUP BY i.name, i.opening_qty
-                ORDER BY i.name
-            """, (decoded_brand,))
-            rows = cur.fetchall() or []
-            conn.close()
-            return jsonify({"ok": True, "brand": decoded_brand, "items": convert_decimals(rows)})
-
-        # Customer role -> allow only fixed brands without company join
-        # (these are the same brands you used in the stock-summary endpoint)
-        ALLOWED_BRANDS = [
-            "Novateur Electrical & Digital Systems Pvt.Ltd",
-            "Elemeasure",
-            "SOCOMEC",
-            "KEI",
-            "KEI (100/180 METER)",
-            "KEI (CONFLAME)",
-            "KEI (HOMECAB)"
-        ]
-
-        # case-insensitive check
-        brand_norm = decoded_brand.lower().strip()
-        allowed_norm = [b.lower().strip() for b in ALLOWED_BRANDS]
-
-        if brand_norm in allowed_norm:
-            # Return items directly from stock_items (no company filter)
-            cur.execute("""
+            cur.execute(f"""
                 SELECT i.name AS item,
                        i.opening_qty AS total_qty,
                        IFNULL(SUM(r.qty), 0) AS reserved_qty,
@@ -973,10 +936,41 @@ def api_stock_items(brand):
                 FROM stock_items i
                 LEFT JOIN stock_reservations r
                   ON i.name = r.item AND r.status='ACTIVE'
-                WHERE LOWER(TRIM(i.category)) = LOWER(TRIM(%s))
+                WHERE LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category))) = %s
                 GROUP BY i.name, i.opening_qty
                 ORDER BY i.name
-            """, (decoded_brand,))
+            """, (decoded_norm,))
+            rows = cur.fetchall() or []
+            conn.close()
+            return jsonify({"ok": True, "brand": decoded_brand, "items": convert_decimals(rows)})
+
+        # Customer role -> allow only fixed brands without company join
+        ALLOWED_BRANDS = [
+            "Novateur Electrical & Digital Systems Pvt.Ltd",
+            "Elemeasure",
+            "SOCOMEC",
+            "KEI",
+            "KEI (100/180 METER)",
+            "KEI (CONFLAME)",
+            "KEI (HOMECAB)"
+        ]
+        allowed_norm = [b.lower().strip() for b in ALLOWED_BRANDS]
+
+        if decoded_norm in allowed_norm:
+            cur.execute(f"""
+                SELECT i.name AS item,
+                       i.opening_qty AS total_qty,
+                       IFNULL(SUM(r.qty), 0) AS reserved_qty,
+                       (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
+                       MAX(r.reserved_by) AS reserved_by,
+                       DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
+                FROM stock_items i
+                LEFT JOIN stock_reservations r
+                  ON i.name = r.item AND r.status='ACTIVE'
+                WHERE LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category))) = %s
+                GROUP BY i.name, i.opening_qty
+                ORDER BY i.name
+            """, (decoded_norm,))
             rows = cur.fetchall() or []
             conn.close()
             return jsonify({"ok": True, "brand": decoded_brand, "items": convert_decimals(rows)})
@@ -988,7 +982,8 @@ def api_stock_items(brand):
 
         company_where = " OR ".join(allowed["clauses"])
         params = allowed["params"].copy()
-        params.insert(0, decoded_brand)  # brand param first for i.category=%s
+        # we still want to match brand on the item-brand field first param
+        params.insert(0, decoded_brand)
 
         sql = f"""
             SELECT DISTINCT i.name AS item,
@@ -996,12 +991,12 @@ def api_stock_items(brand):
                    IFNULL(SUM(r.qty), 0) AS reserved_qty,
                    (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
                    MAX(r.reserved_by) AS reserved_by,
-                   DATE_FORMAT(MAX(r.end_date), '%d-%m-%Y') AS end_date
+                   DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
             FROM stock_items i
             LEFT JOIN stock_reservations r
               ON i.name = r.item AND r.status='ACTIVE'
             JOIN stock_movements m ON m.item = i.name
-            WHERE i.category=%s AND ({company_where})
+            WHERE LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category))) = LOWER(TRIM(%s)) AND ({company_where})
             GROUP BY i.name, i.opening_qty
             ORDER BY i.name
         """
@@ -1012,14 +1007,12 @@ def api_stock_items(brand):
 
     except Exception as e:
         import traceback
-        print("api_stock_items error:", e)
-        print(traceback.format_exc())
+        logging.exception("api_stock_items error: %s", e)
         try:
             conn.close()
         except Exception:
             pass
         return jsonify({"ok": False, "error": "Internal server error"}), 500
-
 
 # ---------------------------------------------------------
 # 🟢 7️⃣ Search Endpoint 
