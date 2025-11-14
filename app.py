@@ -730,12 +730,13 @@ def api_sales_brands():
         conn = get_connection()
         cur = conn.cursor(dictionary=True)
 
+        # exact brand expression used in SELECT — must be repeated in GROUP BY
         brand_expr = "TRIM(COALESCE(NULLIF(i.brand, ''), NULLIF(TRIM(m.company), ''), 'Uncategorized'))"
 
         if q:
             sql = f"""
                 SELECT {brand_expr} AS brand,
-                       SUM(COALESCE(m.amount,0)) AS value
+                       SUM(COALESCE(m.amount, 0)) AS value
                 FROM stock_movements m
                 LEFT JOIN stock_items i ON m.item = i.name
                 WHERE m.movement_type = 'OUT'
@@ -747,7 +748,7 @@ def api_sales_brands():
         else:
             sql = f"""
                 SELECT {brand_expr} AS brand,
-                       SUM(COALESCE(m.amount,0)) AS value
+                       SUM(COALESCE(m.amount, 0)) AS value
                 FROM stock_movements m
                 LEFT JOIN stock_items i ON m.item = i.name
                 WHERE m.movement_type = 'OUT'
@@ -756,13 +757,14 @@ def api_sales_brands():
             """
             params = ()
 
-        logging.debug("Running sales brands SQL. q=%s sql=%s params=%s", q, sql.replace("\n"," "), params)
+        logging.debug("Running sales brands SQL; q=%s", q)
         cur.execute(sql, params)
         rows = cur.fetchall()
         rows = convert_decimals(rows)
         cur.close()
         conn.close()
         return jsonify({"ok": True, "brands": rows})
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -772,8 +774,8 @@ def api_sales_brands():
                 conn.close()
         except:
             pass
-        # return limited trace lines to help debug
         return jsonify({"ok": False, "error": str(e), "trace": tb.splitlines()[-8:]}), 500
+
 
 @app.route("/debug/sales-brands")
 def debug_sales_brands():
