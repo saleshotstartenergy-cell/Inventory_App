@@ -730,27 +730,33 @@ def api_sales_brands():
         conn = get_connection()
         cur = conn.cursor(dictionary=True)
 
-        # compute brand solely from movement.company (no i.brand)
-        inner = """
-            SELECT COALESCE(NULLIF(TRIM(m.company), ''), 'Uncategorized') AS brand,
-                   COALESCE(m.amount, 0) AS amt
+        # Build brand only from movement.company
+        # This never touches stock_items → no i.brand → no errors
+        base_query = """
+            SELECT 
+                COALESCE(NULLIF(TRIM(m.company), ''), 'Uncategorized') AS brand,
+                SUM(COALESCE(m.amount, 0)) AS value
             FROM stock_movements m
             WHERE m.movement_type = 'OUT'
         """
 
-        if q:
-            sql = "SELECT brand, SUM(amt) AS value FROM (" + inner + ") AS x WHERE LOWER(brand) LIKE %s GROUP BY brand ORDER BY value DESC"
-            params = (f"%{q}%",)
-        else:
-            sql = "SELECT brand, SUM(amt) AS value FROM (" + inner + ") AS x GROUP BY brand ORDER BY value DESC"
-            params = ()
+        params = []
 
-        cur.execute(sql, params)
+        if q:
+            base_query += " AND LOWER(TRIM(m.company)) LIKE %s"
+            params.append(f"%{q}%")
+
+        base_query += " GROUP BY brand ORDER BY value DESC"
+
+        cur.execute(base_query, params)
         rows = cur.fetchall()
+
         rows = convert_decimals(rows)
         cur.close()
         conn.close()
+
         return jsonify({"ok": True, "brands": rows})
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -769,32 +775,36 @@ def debug_sales_brands():
     try:
         conn = get_connection()
         cur = conn.cursor(dictionary=True)
+
         sql = """
-            SELECT TRIM(COALESCE(NULLIF(i.brand, ''), 'Uncategorized')) AS brand,
-                   SUM(COALESCE(m.amount,0)) AS value
+            SELECT 
+                COALESCE(NULLIF(TRIM(m.company), ''), 'Uncategorized') AS brand,
+                SUM(COALESCE(m.amount, 0)) AS value
             FROM stock_movements m
-            LEFT JOIN stock_items i ON m.item = i.name
             WHERE m.movement_type = 'OUT'
-            GROUP BY TRIM(COALESCE(i.brand, 'Uncategorized'))
+            GROUP BY brand
             ORDER BY value DESC
-            LIMIT 200
+            LIMIT 100
         """
+
         cur.execute(sql)
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        return jsonify({"ok": True, "rows_count": len(rows), "sample": rows[:50]})
+
+        return jsonify({"ok": True, "rows": rows})
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        # print to server logs and return limited info (safe)
-        logging.exception("debug_sales_brands failed")
+        logging.exception("debug_sales_brands error: %s", e)
         try:
             if conn:
                 conn.close()
         except:
             pass
-        return jsonify({"ok": False, "error": str(e), "trace": tb.splitlines()[-10:] }), 500
+        return jsonify({"ok": False, "error": str(e), "trace": tb.splitlines()[-8:]}), 500
+
 
 
 
