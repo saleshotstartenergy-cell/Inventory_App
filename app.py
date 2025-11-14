@@ -730,32 +730,27 @@ def api_sales_brands():
         conn = get_connection()
         cur = conn.cursor(dictionary=True)
 
-        # inner expression computes brand per-row; outer query aggregates
+        # compute brand solely from movement.company (no i.brand)
         inner = """
-            SELECT
-              COALESCE(NULLIF(TRIM(i.brand), ''), NULLIF(TRIM(m.company), ''), 'Uncategorized') AS brand,
-              COALESCE(m.amount, 0) AS amt
+            SELECT COALESCE(NULLIF(TRIM(m.company), ''), 'Uncategorized') AS brand,
+                   COALESCE(m.amount, 0) AS amt
             FROM stock_movements m
-            LEFT JOIN stock_items i ON m.item = i.name
             WHERE m.movement_type = 'OUT'
         """
 
         if q:
-            # filter on computed brand in outer query; use parameterized LIKE against lower-case
-            sql = f"SELECT brand, SUM(amt) AS value FROM ({inner}) AS x WHERE LOWER(brand) LIKE %s GROUP BY brand ORDER BY value DESC"
+            sql = "SELECT brand, SUM(amt) AS value FROM (" + inner + ") AS x WHERE LOWER(brand) LIKE %s GROUP BY brand ORDER BY value DESC"
             params = (f"%{q}%",)
         else:
-            sql = f"SELECT brand, SUM(amt) AS value FROM ({inner}) AS x GROUP BY brand ORDER BY value DESC"
+            sql = "SELECT brand, SUM(amt) AS value FROM (" + inner + ") AS x GROUP BY brand ORDER BY value DESC"
             params = ()
 
-        logging.debug("Running sales brands derived SQL; q=%s", q)
         cur.execute(sql, params)
         rows = cur.fetchall()
         rows = convert_decimals(rows)
         cur.close()
         conn.close()
         return jsonify({"ok": True, "brands": rows})
-
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
