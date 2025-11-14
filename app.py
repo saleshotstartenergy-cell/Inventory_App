@@ -728,31 +728,52 @@ def api_sales_brands():
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    if q:
-        cur.execute("""
-            SELECT 
-                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
-                SUM(m.amount) AS value
-            FROM stock_movements m
-            WHERE m.movement_type = 'OUT'
-              AND LOWER(TRIM(m.company)) LIKE %s
-            GROUP BY m.company
-            ORDER BY value DESC
-        """, (f"%{q}%",))
-    else:
-        cur.execute("""
-            SELECT 
-                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
-                SUM(m.amount) AS value
-            FROM stock_movements m
-            WHERE m.movement_type = 'OUT'
-            GROUP BY m.company
-            ORDER BY value DESC
-        """)
+    # computed_brand uses movement.company first, then item.brand, then 'Uncategorized'
+    # NULLIF(..., '') converts empty strings to NULL so COALESCE catches them
+    brand_expr = "COALESCE(NULLIF(TRIM(m.company), ''), NULLIF(TRIM(i.brand), ''), 'Uncategorized')"
 
-    data = convert_decimals(cur.fetchall())
-    conn.close()
-    return jsonify({"ok": True, "brands": data})
+    try:
+        if q:
+            # use LOWER(...) for case-insensitive LIKE search
+            cur.execute(f"""
+                SELECT
+                    {brand_expr} AS brand,
+                    SUM(COALESCE(m.amount, 0)) AS value
+                FROM stock_movements m
+                LEFT JOIN stock_items i ON m.item = i.name
+                WHERE m.movement_type = 'OUT'
+                  AND LOWER({brand_expr}) LIKE %s
+                GROUP BY {brand_expr}
+                ORDER BY value DESC
+            """, (f"%{q}%",))
+        else:
+            cur.execute(f"""
+                SELECT
+                    {brand_expr} AS brand,
+                    SUM(COALESCE(m.amount, 0)) AS value
+                FROM stock_movements m
+                LEFT JOIN stock_items i ON m.item = i.name
+                WHERE m.movement_type = 'OUT'
+                GROUP BY {brand_expr}
+                ORDER BY value DESC
+            """)
+
+        rows = cur.fetchall()
+        rows = convert_decimals(rows)
+        return jsonify({"ok": True, "brands": rows})
+    except Exception as e:
+        logging.exception("api_sales_brands error: %s", e)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "Internal server error"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 
 # ---------------------------------------------------------
