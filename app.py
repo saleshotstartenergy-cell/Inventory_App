@@ -728,51 +728,38 @@ def api_sales_brands():
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    # computed_brand uses movement.company first, then item.brand, then 'Uncategorized'
-    # NULLIF(..., '') converts empty strings to NULL so COALESCE catches them
-    brand_expr = "COALESCE(NULLIF(TRIM(m.company), ''), NULLIF(TRIM(i.brand), ''), 'Uncategorized')"
-
     try:
         if q:
-            # use LOWER(...) for case-insensitive LIKE search
-            cur.execute(f"""
-                SELECT
-                    {brand_expr} AS brand,
-                    SUM(COALESCE(m.amount, 0)) AS value
+            cur.execute("""
+                SELECT TRIM(COALESCE(NULLIF(i.brand, ''), 'Uncategorized')) AS brand,
+                       SUM(COALESCE(m.amount,0)) AS value
                 FROM stock_movements m
-                LEFT JOIN stock_items i ON m.item = i.name
+                JOIN stock_items i ON m.item = i.name
                 WHERE m.movement_type = 'OUT'
-                  AND LOWER({brand_expr}) LIKE %s
-                GROUP BY {brand_expr}
+                  AND LOWER(TRIM(COALESCE(i.brand, ''))) LIKE %s
+                GROUP BY TRIM(COALESCE(i.brand, 'Uncategorized'))
                 ORDER BY value DESC
             """, (f"%{q}%",))
         else:
-            cur.execute(f"""
-                SELECT
-                    {brand_expr} AS brand,
-                    SUM(COALESCE(m.amount, 0)) AS value
+            cur.execute("""
+                SELECT TRIM(COALESCE(NULLIF(i.brand, ''), 'Uncategorized')) AS brand,
+                       SUM(COALESCE(m.amount,0)) AS value
                 FROM stock_movements m
-                LEFT JOIN stock_items i ON m.item = i.name
+                JOIN stock_items i ON m.item = i.name
                 WHERE m.movement_type = 'OUT'
-                GROUP BY {brand_expr}
+                GROUP BY TRIM(COALESCE(i.brand, 'Uncategorized'))
                 ORDER BY value DESC
             """)
-
-        rows = cur.fetchall()
-        rows = convert_decimals(rows)
+        rows = convert_decimals(cur.fetchall())
         return jsonify({"ok": True, "brands": rows})
     except Exception as e:
         logging.exception("api_sales_brands error: %s", e)
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: conn.close()
+        except: pass
         return jsonify({"ok": False, "error": "Internal server error"}), 500
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: conn.close()
+        except: pass
 
 
 
