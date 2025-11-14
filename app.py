@@ -725,41 +725,89 @@ def api_sales_summary():
 @app.route("/api/sales-summary/brands")
 def api_sales_brands():
     q = request.args.get("q", "").strip().lower()
-    conn = get_connection()
-    cur = conn.cursor(dictionary=True)
-
+    conn = None
     try:
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
+        brand_expr = "TRIM(COALESCE(NULLIF(i.brand, ''), NULLIF(TRIM(m.company), ''), 'Uncategorized'))"
+
         if q:
-            cur.execute("""
-                SELECT TRIM(COALESCE(NULLIF(i.brand, ''), 'Uncategorized')) AS brand,
+            sql = f"""
+                SELECT {brand_expr} AS brand,
                        SUM(COALESCE(m.amount,0)) AS value
                 FROM stock_movements m
-                JOIN stock_items i ON m.item = i.name
+                LEFT JOIN stock_items i ON m.item = i.name
                 WHERE m.movement_type = 'OUT'
-                  AND LOWER(TRIM(COALESCE(i.brand, ''))) LIKE %s
-                GROUP BY TRIM(COALESCE(i.brand, 'Uncategorized'))
+                  AND LOWER({brand_expr}) LIKE %s
+                GROUP BY {brand_expr}
                 ORDER BY value DESC
-            """, (f"%{q}%",))
+            """
+            params = (f"%{q}%",)
         else:
-            cur.execute("""
-                SELECT TRIM(COALESCE(NULLIF(i.brand, ''), 'Uncategorized')) AS brand,
+            sql = f"""
+                SELECT {brand_expr} AS brand,
                        SUM(COALESCE(m.amount,0)) AS value
                 FROM stock_movements m
-                JOIN stock_items i ON m.item = i.name
+                LEFT JOIN stock_items i ON m.item = i.name
                 WHERE m.movement_type = 'OUT'
-                GROUP BY TRIM(COALESCE(i.brand, 'Uncategorized'))
+                GROUP BY {brand_expr}
                 ORDER BY value DESC
-            """)
-        rows = convert_decimals(cur.fetchall())
+            """
+            params = ()
+
+        logging.debug("Running sales brands SQL. q=%s sql=%s params=%s", q, sql.replace("\n"," "), params)
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        rows = convert_decimals(rows)
+        cur.close()
+        conn.close()
         return jsonify({"ok": True, "brands": rows})
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         logging.exception("api_sales_brands error: %s", e)
-        try: conn.close()
-        except: pass
-        return jsonify({"ok": False, "error": "Internal server error"}), 500
-    finally:
-        try: conn.close()
-        except: pass
+        try:
+            if conn:
+                conn.close()
+        except:
+            pass
+        # return limited trace lines to help debug
+        return jsonify({"ok": False, "error": str(e), "trace": tb.splitlines()[-8:]}), 500
+
+@app.route("/debug/sales-brands")
+def debug_sales_brands():
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+        sql = """
+            SELECT TRIM(COALESCE(NULLIF(i.brand, ''), 'Uncategorized')) AS brand,
+                   SUM(COALESCE(m.amount,0)) AS value
+            FROM stock_movements m
+            LEFT JOIN stock_items i ON m.item = i.name
+            WHERE m.movement_type = 'OUT'
+            GROUP BY TRIM(COALESCE(i.brand, 'Uncategorized'))
+            ORDER BY value DESC
+            LIMIT 200
+        """
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"ok": True, "rows_count": len(rows), "sample": rows[:50]})
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        # print to server logs and return limited info (safe)
+        logging.exception("debug_sales_brands failed")
+        try:
+            if conn:
+                conn.close()
+        except:
+            pass
+        return jsonify({"ok": False, "error": str(e), "trace": tb.splitlines()[-10:] }), 500
+
 
 
 
