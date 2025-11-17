@@ -711,51 +711,59 @@ def api_sales_brands():
         conn = get_connection()
         cur = conn.cursor(dictionary=True)
 
-        # fetch per-row brand candidates (company and item->brand if available)
-        cur.execute("""
-            SELECT m.amount AS amount,
-                   TRIM(NULLIF(m.company, '')) AS movement_company,
-                   TRIM(NULLIF(i.brand, '')) AS item_brand
+        # inner: compute a brand per movement row (company -> category -> 'Uncategorized')
+        inner = """
+            SELECT
+              COALESCE(NULLIF(TRIM(m.company), ''), NULLIF(TRIM(i.category), ''), 'Uncategorized') AS brand,
+              COALESCE(m.amount, 0) AS amt
             FROM stock_movements m
             LEFT JOIN stock_items i ON m.item = i.name
             WHERE m.movement_type = 'OUT'
-        """)
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
+        """
 
-        # aggregate in Python: prefer movement_company, then item_brand, then 'Uncategorized'
-        totals = {}
-        for r in rows:
-            amt = float(r.get("amount") or 0.0)
-            company = r.get("movement_company") or None
-            item_brand = r.get("item_brand") or None
-            brand = (company or item_brand or "Uncategorized").strip()
-            key = brand.lower()  # for q filtering & stable grouping
-            totals.setdefault(key, {"brand": brand, "value": 0.0})
-            totals[key]["value"] += amt
-
-        # convert to list and apply optional q filter
-        result = list(totals.values())
         if q:
-            result = [r for r in result if q in r["brand"].lower()]
+            # outer: filter on computed brand (case-insensitive) then aggregate
+            sql = f"""
+                SELECT brand, SUM(amt) AS value
+                FROM ({inner}) AS x
+                WHERE LOWER(brand) LIKE %s
+                GROUP BY brand
+                ORDER BY value DESC
+            """
+            params = (f"%{q}%",)
+        else:
+            sql = f"""
+                SELECT brand, SUM(amt) AS value
+                FROM ({inner}) AS x
+                GROUP BY brand
+                ORDER BY value DESC
+            """
+            params = ()
 
-        # sort by value desc
-        result.sort(key=lambda x: x["value"], reverse=True)
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+        rows = convert_decimals(rows)
 
-        # convert decimals (if any) and return
-        return jsonify({"ok": True, "brands": result})
+        return jsonify({"ok": True, "brands": rows})
 
     except Exception as e:
         import traceback, logging
         tb = traceback.format_exc()
-        logging.exception("api_sales_brands (py-agg) error: %s", e)
+        logging.exception("api_sales_brands error: %s", e)
+        # return limited diagnostic info to help debug while avoiding huge traces
+        return jsonify({"ok": False, "error": "Internal server error", "detail": str(e), "trace": tb.splitlines()[-8:]}), 500
+
+    finally:
+        try:
+            if cur:
+                cur.close()
+        except Exception:
+            pass
         try:
             if conn:
                 conn.close()
-        except:
+        except Exception:
             pass
-        return jsonify({"ok": False, "error": str(e), "trace": tb.splitlines()[-8:]}), 500
 
 
 
