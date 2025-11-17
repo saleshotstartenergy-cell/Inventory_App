@@ -706,39 +706,56 @@ def api_login():
 @app.route("/api/sales-summary/brands")
 def api_sales_brands():
     q = request.args.get("q", "").strip().lower()
-    conn = get_connection()
-    cur = conn.cursor(dictionary=True)
-
+    conn = None
     try:
-        if q:
-            cur.execute("""
-                SELECT TRIM(COALESCE(NULLIF(i.brand, ''), NULLIF(TRIM(m.company), ''), 'Uncategorized')) AS brand,
-                       SUM(COALESCE(m.amount,0)) AS value
-                FROM stock_movements m
-                LEFT JOIN stock_items i ON m.item = i.name
-                WHERE m.movement_type = 'OUT'
-                  AND LOWER(TRIM(COALESCE(i.brand, m.company, ''))) LIKE %s
-                GROUP BY TRIM(COALESCE(i.brand, m.company, 'Uncategorized'))
-                ORDER BY value DESC
-            """, (f"%{q}%",))
-        else:
-            cur.execute("""
-                SELECT TRIM(COALESCE(NULLIF(i.brand, ''), NULLIF(TRIM(m.company), ''), 'Uncategorized')) AS brand,
-                       SUM(COALESCE(m.amount,0)) AS value
-                FROM stock_movements m
-                LEFT JOIN stock_items i ON m.item = i.name
-                WHERE m.movement_type = 'OUT'
-                GROUP BY TRIM(COALESCE(i.brand, m.company, 'Uncategorized'))
-                ORDER BY value DESC
-            """)
-        rows = convert_decimals(cur.fetchall())
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
+        # fetch per-row brand candidates (company and item->brand if available)
+        cur.execute("""
+            SELECT m.amount AS amount,
+                   TRIM(NULLIF(m.company, '')) AS movement_company,
+                   TRIM(NULLIF(i.brand, '')) AS item_brand
+            FROM stock_movements m
+            LEFT JOIN stock_items i ON m.item = i.name
+            WHERE m.movement_type = 'OUT'
+        """)
+        rows = cur.fetchall()
+        cur.close()
         conn.close()
-        return jsonify({"ok": True, "brands": rows})
+
+        # aggregate in Python: prefer movement_company, then item_brand, then 'Uncategorized'
+        totals = {}
+        for r in rows:
+            amt = float(r.get("amount") or 0.0)
+            company = r.get("movement_company") or None
+            item_brand = r.get("item_brand") or None
+            brand = (company or item_brand or "Uncategorized").strip()
+            key = brand.lower()  # for q filtering & stable grouping
+            totals.setdefault(key, {"brand": brand, "value": 0.0})
+            totals[key]["value"] += amt
+
+        # convert to list and apply optional q filter
+        result = list(totals.values())
+        if q:
+            result = [r for r in result if q in r["brand"].lower()]
+
+        # sort by value desc
+        result.sort(key=lambda x: x["value"], reverse=True)
+
+        # convert decimals (if any) and return
+        return jsonify({"ok": True, "brands": result})
+
     except Exception as e:
-        logging.exception("api_sales_brands error")
-        try: conn.close()
-        except: pass
-        return jsonify({"ok": False, "error": str(e)}), 500
+        import traceback, logging
+        tb = traceback.format_exc()
+        logging.exception("api_sales_brands (py-agg) error: %s", e)
+        try:
+            if conn:
+                conn.close()
+        except:
+            pass
+        return jsonify({"ok": False, "error": str(e), "trace": tb.splitlines()[-8:]}), 500
 
 
 
