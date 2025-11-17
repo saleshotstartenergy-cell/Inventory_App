@@ -786,13 +786,12 @@ def api_sales_brands():
 # ---------------------------------------------------------
 # 🟢 4️⃣ Monthly Sales for Brand (3rd layer)
 # ---------------------------------------------------------
-from urllib.parse import unquote_plus
-
 @app.route("/api/sales-summary/brands/<path:brand>")
 def api_sales_monthly(brand):
-    decoded_brand = unquote_plus(brand or "").strip()
+    # decode the incoming path parameter (safer)
+    decoded_brand = unquote_plus(brand or "")
+    # optional year filter from query param (e.g. ?year=2025)
     year_arg = request.args.get("year", "").strip()
-
     year = None
     try:
         if year_arg:
@@ -800,92 +799,63 @@ def api_sales_monthly(brand):
     except Exception:
         year = None
 
-    conn = None
-    cur = None
-    try:
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
 
-        # Inner: compute per-row brand (company -> category -> 'Uncategorized')
-        inner = """
-            SELECT
-              COALESCE(NULLIF(TRIM(m.company), ''), NULLIF(TRIM(i.category), ''), 'Uncategorized') AS brand,
-              m.date AS date,
-              COALESCE(m.amount, 0) AS amount
+    # Build SQL with optional year filter
+    sql = """
+        SELECT 
+            DATE_FORMAT(m.date, '%M %Y') AS month,
+            DATE_FORMAT(m.date, '%Y-%m') AS sort_key,
+            SUM(m.amount) AS value
+        FROM stock_movements m
+        JOIN stock_items i ON m.item = i.name
+        WHERE m.movement_type = 'OUT'
+          AND LOWER(TRIM(i.category)) = LOWER(TRIM(%s))
+    """
+    params = [decoded_brand]
+
+    if year is not None:
+        sql += " AND YEAR(m.date) = %s"
+        params.append(year)
+
+    sql += " GROUP BY sort_key, month ORDER BY sort_key"
+
+    cur.execute(sql, tuple(params))
+    data = cur.fetchall()
+    data = convert_decimals(data)
+
+    # If monthly rows are empty, also provide a brand-level total (helpful client-side)
+    total = None
+    if not data:
+        total_sql = """
+            SELECT SUM(m.amount) AS total
             FROM stock_movements m
-            LEFT JOIN stock_items i ON m.item = i.name
+            JOIN stock_items i ON m.item = i.name
             WHERE m.movement_type = 'OUT'
+              AND LOWER(TRIM(i.category)) = LOWER(TRIM(%s))
         """
-
-        # Outer: filter by brand (case-insensitive) and optional year, then aggregate by month
-        params = [decoded_brand]
-        sql = f"""
-            SELECT
-                DATE_FORMAT(date, '%%M %%Y') AS month,
-                DATE_FORMAT(date, '%%Y-%%m') AS sort_key,
-                SUM(amount) AS value
-            FROM ({inner}) x
-            WHERE LOWER(brand) = LOWER(%s)
-        """
-
+        tparams = [decoded_brand]
+        # optionally respect year when computing total if you prefer
+        # If you want total restricted to same year, uncomment the following:
         if year is not None:
-            sql += " AND YEAR(date) = %s"
-            params.append(year)
+            total_sql += " AND YEAR(m.date) = %s"
+            tparams.append(year)
 
-        sql += " GROUP BY sort_key, month ORDER BY sort_key;"
+        cur.execute(total_sql, tuple(tparams))
+        tr = cur.fetchone()
+        if tr and tr.get("total") is not None:
+            # convert Decimal -> float if needed (your convert_decimals may already do this)
+            total = float(tr["total"])
 
-        cur.execute(sql, tuple(params))
-        rows = cur.fetchall() or []
-        rows = convert_decimals(rows)
+    cur.close()
+    conn.close()
 
-        # If monthly rows are empty, return brand-level total (use same derived inner)
-        total = None
-        if not rows:
-            tparams = [decoded_brand]
-            total_sql = f"SELECT SUM(amount) AS total FROM ({inner}) x WHERE LOWER(brand) = LOWER(%s)"
-            if year is not None:
-                total_sql += " AND YEAR(date) = %s"
-                tparams.append(year)
+    resp = {"ok": True, "brand": decoded_brand, "months": data}
+    if total is not None:
+        resp["total"] = total
 
-            cur.execute(total_sql, tuple(tparams))
-            tr = cur.fetchone()
-            if tr and tr.get("total") is not None:
-                total = float(tr["total"])
-
-        resp = {"ok": True, "brand": decoded_brand, "months": rows}
-        if total is not None:
-            resp["total"] = total
-
-        return jsonify(resp)
-
-    except Exception as e:
-        import traceback, logging
-        tb = traceback.format_exc()
-        logging.exception("api_sales_monthly error: %s", e)
-        try:
-            if cur:
-                cur.close()
-        except Exception:
-            pass
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-        return jsonify({"ok": False, "error": "Internal server error", "detail": str(e), "trace": tb.splitlines()[-8:]}), 500
-    finally:
-        try:
-            if cur:
-                cur.close()
-        except Exception:
-            pass
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-
+    return jsonify(resp)
 
 # ---------------------------------------------------------
 # 🟢 5️⃣ Stock Summary (1st layer)
