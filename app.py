@@ -699,9 +699,27 @@ def api_login():
         "role": user["role"]
     }), 200
 
-
 # ---------------------------------------------------------
 # 🟢 2️⃣ Sales Summary (overall)
+# ---------------------------------------------------------
+@app.route("/api/sales-summary")
+@requires_role("admin")
+def api_sales_summary():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT SUM(amount) AS total
+        FROM stock_movements
+        WHERE movement_type='OUT'
+    """)
+    row = cur.fetchone()
+    total = (row[0] if row and isinstance(row, (list, tuple)) else row.get("total")) if row else 0
+    conn.close()
+    total = convert_decimals(total)
+    return jsonify({"ok": True, "total_sales": total})
+
+# ---------------------------------------------------------
+# 🟢 2️⃣ 2nd layer Sales Summary (overall)
 # ---------------------------------------------------------
 @app.route("/api/sales-summary/brands")
 def api_sales_brands():
