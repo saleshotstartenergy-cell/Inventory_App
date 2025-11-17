@@ -709,31 +709,37 @@ def api_sales_brands():
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
 
-    if q:
-        cur.execute("""
-            SELECT 
-                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
-                SUM(m.amount) AS value
-            FROM stock_movements m
-            WHERE m.movement_type = 'OUT'
-              AND LOWER(TRIM(m.company)) LIKE %s
-            GROUP BY m.company
-            ORDER BY value DESC
-        """, (f"%{q}%",))
-    else:
-        cur.execute("""
-            SELECT 
-                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
-                SUM(m.amount) AS value
-            FROM stock_movements m
-            WHERE m.movement_type = 'OUT'
-            GROUP BY m.company
-            ORDER BY value DESC
-        """)
+    try:
+        if q:
+            cur.execute("""
+                SELECT TRIM(COALESCE(NULLIF(i.brand, ''), NULLIF(TRIM(m.company), ''), 'Uncategorized')) AS brand,
+                       SUM(COALESCE(m.amount,0)) AS value
+                FROM stock_movements m
+                LEFT JOIN stock_items i ON m.item = i.name
+                WHERE m.movement_type = 'OUT'
+                  AND LOWER(TRIM(COALESCE(i.brand, m.company, ''))) LIKE %s
+                GROUP BY TRIM(COALESCE(i.brand, m.company, 'Uncategorized'))
+                ORDER BY value DESC
+            """, (f"%{q}%",))
+        else:
+            cur.execute("""
+                SELECT TRIM(COALESCE(NULLIF(i.brand, ''), NULLIF(TRIM(m.company), ''), 'Uncategorized')) AS brand,
+                       SUM(COALESCE(m.amount,0)) AS value
+                FROM stock_movements m
+                LEFT JOIN stock_items i ON m.item = i.name
+                WHERE m.movement_type = 'OUT'
+                GROUP BY TRIM(COALESCE(i.brand, m.company, 'Uncategorized'))
+                ORDER BY value DESC
+            """)
+        rows = convert_decimals(cur.fetchall())
+        conn.close()
+        return jsonify({"ok": True, "brands": rows})
+    except Exception as e:
+        logging.exception("api_sales_brands error")
+        try: conn.close()
+        except: pass
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    data = convert_decimals(cur.fetchall())
-    conn.close()
-    return jsonify({"ok": True, "brands": data})
 
 
 @app.route("/debug/sales-brands")
