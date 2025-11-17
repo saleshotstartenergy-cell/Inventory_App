@@ -703,70 +703,37 @@ def api_login():
 # ---------------------------------------------------------
 # 🟢 2️⃣ Sales Summary (overall)
 # ---------------------------------------------------------
-@app.route("/api/sales-summary")
-@requires_role("admin")
-def api_sales_summary():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT SUM(amount) AS total
-        FROM stock_movements
-        WHERE movement_type='OUT'
-    """)
-    row = cur.fetchone()
-    total = (row[0] if row and isinstance(row, (list, tuple)) else row.get("total")) if row else 0
-    conn.close()
-    total = convert_decimals(total)
-    return jsonify({"ok": True, "total_sales": total})
-
-# ---------------------------------------------------------
-# 🟢 3️⃣ Sales by Brand (2nd layer)
-# ---------------------------------------------------------
 @app.route("/api/sales-summary/brands")
 def api_sales_brands():
     q = request.args.get("q", "").strip().lower()
-    conn = None
-    try:
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
 
-        # Build brand only from movement.company
-        # This never touches stock_items → no i.brand → no errors
-        base_query = """
+    if q:
+        cur.execute("""
             SELECT 
-                COALESCE(NULLIF(TRIM(m.company), ''), 'Uncategorized') AS brand,
-                SUM(COALESCE(m.amount, 0)) AS value
+                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
+                SUM(m.amount) AS value
             FROM stock_movements m
             WHERE m.movement_type = 'OUT'
-        """
+              AND LOWER(TRIM(m.company)) LIKE %s
+            GROUP BY m.company
+            ORDER BY value DESC
+        """, (f"%{q}%",))
+    else:
+        cur.execute("""
+            SELECT 
+                TRIM(IFNULL(m.company, 'Uncategorized')) AS brand,
+                SUM(m.amount) AS value
+            FROM stock_movements m
+            WHERE m.movement_type = 'OUT'
+            GROUP BY m.company
+            ORDER BY value DESC
+        """)
 
-        params = []
-
-        if q:
-            base_query += " AND LOWER(TRIM(m.company)) LIKE %s"
-            params.append(f"%{q}%")
-
-        base_query += " GROUP BY brand ORDER BY value DESC"
-
-        cur.execute(base_query, params)
-        rows = cur.fetchall()
-
-        rows = convert_decimals(rows)
-        cur.close()
-        conn.close()
-
-        return jsonify({"ok": True, "brands": rows})
-
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        logging.exception("api_sales_brands error: %s", e)
-        try:
-            if conn:
-                conn.close()
-        except:
-            pass
-        return jsonify({"ok": False, "error": str(e), "trace": tb.splitlines()[-8:]}), 500
+    data = convert_decimals(cur.fetchall())
+    conn.close()
+    return jsonify({"ok": True, "brands": data})
 
 
 @app.route("/debug/sales-brands")
