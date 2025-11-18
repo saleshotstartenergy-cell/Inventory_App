@@ -641,16 +641,34 @@ def send_reservation_notification(item, qty, user, end_date):
     body = f"{user} reserved {qty} units of {item} until {end_date}."
     msg = MIMEText(body)
     msg["Subject"] = "Stock Reserved Notification"
-    msg["From"] = os.getenv("EMAIL_USER", "yourapp@example.com")
-    msg["To"] = os.getenv("EMAIL_NOTIFY", "team@example.com")
+    sender = os.getenv("EMAIL_USER", "yourapp@example.com")
+    receivers = os.getenv("EMAIL_NOTIFY", "team@example.com")
+    msg["From"] = sender
+    msg["To"] = receivers
+
+    # receivers may be comma-separated
+    rcpts = [r.strip() for r in receivers.split(",") if r.strip()]
+    if not rcpts:
+        print("send_reservation_notification: no EMAIL_NOTIFY configured, skipping email")
+        return
 
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as s:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
+            s.set_debuglevel(0)
             s.starttls()
-            s.login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS"))
-            s.send_message(msg)
+            user_env = os.getenv("EMAIL_USER")
+            pass_env = os.getenv("EMAIL_PASS")
+            if not user_env or not pass_env:
+                raise RuntimeError("EMAIL_USER or EMAIL_PASS not set in environment")
+            s.login(user_env, pass_env)
+            s.sendmail(sender, rcpts, msg.as_string())
+            print("send_reservation_notification: sent email to", rcpts)
     except Exception as e:
+        # print full info to logs (not leaked to client)
+        import traceback
         print("Email sending failed:", e)
+        print(traceback.format_exc())
+
 
 def auto_release_reservations():
     """Auto-cancel reservations that exceed available qty (sold in Tally)."""
@@ -671,6 +689,88 @@ def auto_release_reservations():
     """)
     conn.commit()
     conn.close()
+
+def auto_release_reservations_smart():
+    """
+    For each item:
+     - compute available_qty = opening_qty - SUM(OUT movements)
+     - fetch ACTIVE reservations ordered by start_date ASC (older first)
+     - allow reservations cumulatively until they fit within available_qty
+     - cancel (status='CANCELLED') the newest reservations when total_reserved > available_qty
+    """
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    try:
+        # iterate items with any active reservations
+        cur.execute("""
+            SELECT DISTINCT r.item
+            FROM stock_reservations r
+            WHERE r.status='ACTIVE'
+        """)
+        items = [row['item'] for row in cur.fetchall() or []]
+
+        for item in items:
+            # compute available_qty from stock_items and stock_movements
+            cur.execute("""
+                SELECT
+                  COALESCE(i.opening_qty, 0) AS opening_qty,
+                  COALESCE(SUM(m.qty), 0) AS sold_qty
+                FROM stock_items i
+                LEFT JOIN stock_movements m ON m.item = i.name AND m.movement_type='OUT'
+                WHERE i.name = %s
+                GROUP BY i.opening_qty
+            """, (item,))
+            ir = cur.fetchone()
+            if not ir:
+                # no stock item record — skip or cancel all?
+                continue
+            opening_qty = float(ir.get('opening_qty') or 0)
+            sold_qty = float(ir.get('sold_qty') or 0)
+            available_qty = max(0.0, opening_qty - sold_qty)
+
+            # fetch ACTIVE reservations ordered by start_date asc (oldest first)
+            cur.execute("""
+                SELECT id, qty, start_date
+                FROM stock_reservations
+                WHERE item = %s AND status='ACTIVE'
+                ORDER BY start_date ASC, id ASC
+            """, (item,))
+            res_rows = cur.fetchall() or []
+
+            # keep older reservations while cumulative <= available_qty
+            cum = 0.0
+            to_cancel = []  # list of reservation ids to cancel (the newest ones)
+            for r in res_rows:
+                q = float(r.get('qty') or 0)
+                if cum + q <= available_qty + 1e-9:
+                    cum += q
+                else:
+                    # this reservation cannot be fully kept; mark for cancellation
+                    to_cancel.append(r['id'])
+
+            if to_cancel:
+                # cancel them
+                cur.execute(f"""
+                    UPDATE stock_reservations
+                    SET status='CANCELLED', remarks = CONCAT(IFNULL(remarks,''), ' Auto-cancelled due to shortage on ', CURDATE())
+                    WHERE id IN ({','.join(['%s'] * len(to_cancel))})
+                """, tuple(to_cancel))
+                conn.commit()
+
+    except Exception as e:
+        print("auto_release_reservations_smart error:", e)
+        import traceback
+        print(traceback.format_exc())
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -1208,6 +1308,62 @@ def api_stock_reserve():
                 conn.close()
             except Exception:
                 pass
+
+# Add near other API routes in your Flask app
+from urllib.parse import unquote
+
+@app.route("/api/reservations")
+def api_reservations():
+    """
+    GET /api/reservations?items=<comma-separated-encoded-names>
+    Returns: { ok: true, reservations: { "<item>": [ {id, item, reserved_by, qty, start_date, end_date, status, remarks}, ... ] } }
+    If no items param provided, returns recent ACTIVE reservations (limit 500).
+    """
+    items_param = request.args.get("items", "").strip()
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+
+    try:
+        if items_param:
+            # items_param is comma-separated, URL-encoded item names (client encodes each item)
+            parts = [unquote(p) for p in items_param.split(",") if p.strip()]
+            # Use parameter placeholders
+            placeholders = ",".join(["%s"] * len(parts))
+            sql = f"""
+                SELECT id, item, reserved_by, qty, DATE_FORMAT(start_date, '%%Y-%%m-%%d') AS start_date,
+                       DATE_FORMAT(end_date, '%%Y-%%m-%%d') AS end_date, status, remarks
+                FROM stock_reservations
+                WHERE item IN ({placeholders}) AND status IN ('ACTIVE','EXPIRED','CANCELLED')
+                ORDER BY item, start_date ASC, id ASC
+            """
+            cur.execute(sql, tuple(parts))
+        else:
+            # return recent active reservations if no items param provided
+            cur.execute("""
+                SELECT id, item, reserved_by, qty, DATE_FORMAT(start_date, '%%Y-%%m-%%d') AS start_date,
+                       DATE_FORMAT(end_date, '%%Y-%%m-%%d') AS end_date, status, remarks
+                FROM stock_reservations
+                WHERE status='ACTIVE' AND (end_date IS NULL OR end_date >= CURDATE())
+                ORDER BY item, start_date ASC
+                LIMIT 500
+            """)
+        rows = cur.fetchall() or []
+        # group by item
+        out = {}
+        for r in rows:
+            out.setdefault(r['item'], []).append(r)
+        return jsonify({"ok": True, "reservations": out})
+    except Exception as e:
+        print("api_reservations error:", e)
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({"ok": False, "error": "Internal server error"}), 500
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 # ---------------------------
 # Custom INR filter (template filter)
