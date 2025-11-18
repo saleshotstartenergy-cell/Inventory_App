@@ -1260,7 +1260,7 @@ def api_stock_reserve():
             VALUES (%s, %s, %s, CURDATE(), %s, 'ACTIVE')
         """, (item, reserved_by, qty, end_date))
 
-        # Recompute aggregates for response
+                # Recompute aggregates for response (fetch raw dates)
         cur.execute("""
             SELECT 
                 i.name AS item,
@@ -1268,7 +1268,8 @@ def api_stock_reserve():
                 IFNULL(SUM(r.qty), 0) AS reserved_qty,
                 (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
                 MAX(r.reserved_by) AS reserved_by,
-                DATE_FORMAT(MAX(r.end_date), '%%Y-%%m-%%d') AS reserve_until
+                MAX(r.start_date) AS max_start_date,
+                MAX(r.end_date) AS max_end_date
             FROM stock_items i
             LEFT JOIN stock_reservations r
               ON r.item = i.name AND r.status='ACTIVE' AND (r.end_date IS NULL OR r.end_date >= CURDATE())
@@ -1276,6 +1277,23 @@ def api_stock_reserve():
             GROUP BY i.name, i.opening_qty
         """, (item,))
         agg = cur.fetchone() or {}
+
+        # Format dates to dd-mm-yyyy for aggregates
+        def _fmt_date_obj(val):
+            if val is None:
+                return None
+            if isinstance(val, (datetime, date)):
+                return val.strftime("%d-%m-%Y")
+            # if it's a string ISO
+            try:
+                return datetime.fromisoformat(str(val)).date().strftime("%d-%m-%Y")
+            except Exception:
+                return str(val)
+
+        if agg:
+            agg = convert_decimals(agg)
+            agg["reserve_until"] = _fmt_date_obj(agg.pop("max_end_date", None))
+            agg["last_reserve_start"] = _fmt_date_obj(agg.pop("max_start_date", None))
 
         conn.commit()
 
@@ -1310,60 +1328,97 @@ def api_stock_reserve():
                 pass
 
 # Add near other API routes in your Flask app
-from urllib.parse import unquote
+from urllib.parse import unquote_plus
 
 @app.route("/api/reservations")
 def api_reservations():
     """
-    GET /api/reservations?items=<comma-separated-encoded-names>
-    Returns: { ok: true, reservations: { "<item>": [ {id, item, reserved_by, qty, start_date, end_date, status, remarks}, ... ] } }
-    If no items param provided, returns recent ACTIVE reservations (limit 500).
+    /api/reservations?items=ItemA,ItemB&only_active=true
+    Returns reservations grouped by item with dates formatted as dd-mm-yyyy.
     """
     items_param = request.args.get("items", "").strip()
-    conn = get_connection()
-    cur = conn.cursor(dictionary=True)
+    if not items_param:
+        return jsonify({"ok": True, "reservations": {}})
+
+    raw_items = [unquote_plus(p).strip() for p in items_param.split(",") if p.strip()]
+    if not raw_items:
+        return jsonify({"ok": True, "reservations": {}})
+
+    only_active = request.args.get("only_active", "").lower() in ("1", "true", "yes")
+
+    placeholders = ",".join(["%s"] * len(raw_items))
+    params = raw_items.copy()
+
+    where_clauses = [f"r.item IN ({placeholders})"]
+    if only_active:
+        where_clauses.append("r.status = 'ACTIVE'")
+        where_clauses.append("(r.end_date IS NULL OR r.end_date >= CURDATE())")
+
+    where_sql = " AND ".join(where_clauses)
 
     try:
-        if items_param:
-            # items_param is comma-separated, URL-encoded item names (client encodes each item)
-            parts = [unquote(p) for p in items_param.split(",") if p.strip()]
-            # Use parameter placeholders
-            placeholders = ",".join(["%s"] * len(parts))
-            sql = f"""
-                SELECT id, item, reserved_by, qty, DATE_FORMAT(start_date, '%%Y-%%m-%%d') AS start_date,
-                       DATE_FORMAT(end_date, '%%Y-%%m-%%d') AS end_date, status, remarks
-                FROM stock_reservations
-                WHERE item IN ({placeholders}) AND status IN ('ACTIVE','EXPIRED','CANCELLED')
-                ORDER BY item, start_date ASC, id ASC
-            """
-            cur.execute(sql, tuple(parts))
-        else:
-            # return recent active reservations if no items param provided
-            cur.execute("""
-                SELECT id, item, reserved_by, qty, DATE_FORMAT(start_date, '%d-%m-%y') AS start_date,
-                       DATE_FORMAT(end_date, '%d-%m-%y') AS end_date, status, remarks
-                FROM stock_reservations
-                WHERE status='ACTIVE' AND (end_date IS NULL OR end_date >= CURDATE())
-                ORDER BY item, start_date ASC
-                LIMIT 500
-            """)
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+        sql = f"""
+            SELECT
+                r.id,
+                r.item,
+                r.reserved_by,
+                r.qty,
+                r.start_date,
+                r.end_date,
+                r.status,
+                r.remarks
+            FROM stock_reservations r
+            WHERE {where_sql}
+            ORDER BY r.item, r.start_date, r.id
+        """
+        cur.execute(sql, tuple(params))
         rows = cur.fetchall() or []
-        # group by item
-        out = {}
+        cur.close()
+        conn.close()
+
+        # Format dates to dd-mm-yyyy and convert decimals
+        out = []
         for r in rows:
-            out.setdefault(r['item'], []).append(r)
-        return jsonify({"ok": True, "reservations": out})
+            r2 = convert_decimals(r)
+            # convert_decimals turns date -> ISO string (YYYY-MM-DD) or leaves string; handle both
+            sd = r2.get("start_date")
+            ed = r2.get("end_date")
+            def fmt_date(v):
+                if v is None:
+                    return None
+                if isinstance(v, (str,)):
+                    # if it's ISO 'YYYY-MM-DD', convert; if already formatted, try to parse
+                    try:
+                        dt = datetime.fromisoformat(v).date()
+                        return dt.strftime("%d-%m-%Y")
+                    except Exception:
+                        return v
+                if isinstance(v, (datetime, date)):
+                    return v.strftime("%d-%m-%Y")
+                return str(v)
+
+            r2["start_date"] = fmt_date(sd)
+            r2["end_date"] = fmt_date(ed)
+            out.append(r2)
+
+        grouped = {}
+        for r in out:
+            key = r.get("item") or ""
+            grouped.setdefault(key, []).append(r)
+
+        return jsonify({"ok": True, "reservations": grouped})
     except Exception as e:
-        print("api_reservations error:", e)
         import traceback
+        print("api_reservations error:", e)
         print(traceback.format_exc())
-        return jsonify({"ok": False, "error": "Internal server error"}), 500
-    finally:
         try:
-            cur.close()
             conn.close()
         except Exception:
             pass
+        return jsonify({"ok": False, "error": "Internal server error"}), 500
+
 
 # ---------------------------
 # Custom INR filter (template filter)
