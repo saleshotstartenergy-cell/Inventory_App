@@ -1186,15 +1186,25 @@ def api_search():
 
         results = cur.fetchall() or []
         results = convert_decimals(results)
-
-        # Ensure numeric defaults and consistent keys for client
         for row in results:
+    # convert numeric defaults
             row['total_qty'] = row.get('total_qty') or 0
             row['reserved_qty'] = row.get('reserved_qty') or 0
             row['available_qty'] = row.get('available_qty') or max(0, (row['total_qty'] - row['reserved_qty']))
-            # keep both 'item' and 'name' for compatibility
-            if 'name' not in row and 'item' in row:
-                row['name'] = row['item']
+
+    # format reserve_until to dd-mm-yyyy
+            ru = row.get('reserve_until')
+            if ru:
+             try:
+              if isinstance(ru, (str,)):
+                dt = datetime.fromisoformat(ru).date()
+              else:
+                dt = ru  # already date
+              row['reserve_until'] = dt.strftime("%d-%m-%Y")
+             except Exception:
+            # leave as-is if parse fails
+              pass
+
 
     finally:
         cur.close()
