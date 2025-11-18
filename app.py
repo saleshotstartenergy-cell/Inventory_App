@@ -1340,8 +1340,8 @@ def api_reservations():
         else:
             # return recent active reservations if no items param provided
             cur.execute("""
-                SELECT id, item, reserved_by, qty, DATE_FORMAT(start_date, '%%Y-%%m-%%d') AS start_date,
-                       DATE_FORMAT(end_date, '%%Y-%%m-%%d') AS end_date, status, remarks
+                SELECT id, item, reserved_by, qty, DATE_FORMAT(start_date, '%d-%m-%y') AS start_date,
+                       DATE_FORMAT(end_date, '%d-%m-%y') AS end_date, status, remarks
                 FROM stock_reservations
                 WHERE status='ACTIVE' AND (end_date IS NULL OR end_date >= CURDATE())
                 ORDER BY item, start_date ASC
