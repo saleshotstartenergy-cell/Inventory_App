@@ -1059,7 +1059,9 @@ def api_stock_items(brand):
         brand_expr = "LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category)))"
         decoded_norm = decoded_brand.lower().strip()
 
-        # Admin / sales -> full list (unchanged except brand_expr)
+        # -------------------------------
+        # Admin / sales → full access
+        # -------------------------------
         if allowed is None:
             cur.execute(f"""
                 SELECT i.name AS item,
@@ -1067,19 +1069,42 @@ def api_stock_items(brand):
                        IFNULL(SUM(r.qty), 0) AS reserved_qty,
                        (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
                        MAX(r.reserved_by) AS reserved_by,
-                       DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
+                       MAX(r.end_date) AS end_date
                 FROM stock_items i
                 LEFT JOIN stock_reservations r
                   ON i.name = r.item AND r.status='ACTIVE'
-                WHERE LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category))) = %s
+                WHERE {brand_expr} = %s
                 GROUP BY i.name, i.opening_qty
                 ORDER BY i.name
             """, (decoded_norm,))
+
             rows = cur.fetchall() or []
             conn.close()
-            return jsonify({"ok": True, "brand": decoded_brand, "items": convert_decimals(rows)})
 
-        # Customer role -> allow only fixed brands without company join
+            # 🔥 Format date to dd-mm-yyyy exactly
+            rows = convert_decimals(rows)
+
+            for r in rows:
+                ed = r.get("end_date")
+                if not ed:
+                    r["end_date"] = "-"
+                    continue
+                try:
+                    if isinstance(ed, str):
+                        dt = datetime.fromisoformat(ed).date()
+                    elif isinstance(ed, datetime):
+                        dt = ed.date()
+                    else:
+                        dt = ed
+                    r["end_date"] = dt.strftime("%d-%m-%Y")
+                except Exception:
+                    r["end_date"] = str(ed)
+
+            return jsonify({"ok": True, "brand": decoded_brand, "items": rows})
+
+        # -------------------------------
+        # Customer → allowed brands only
+        # -------------------------------
         ALLOWED_BRANDS = [
             "Novateur Electrical & Digital Systems Pvt.Ltd",
             "Elemeasure",
@@ -1098,26 +1123,45 @@ def api_stock_items(brand):
                        IFNULL(SUM(r.qty), 0) AS reserved_qty,
                        (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
                        MAX(r.reserved_by) AS reserved_by,
-                       DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
+                       MAX(r.end_date) AS end_date
                 FROM stock_items i
                 LEFT JOIN stock_reservations r
                   ON i.name = r.item AND r.status='ACTIVE'
-                WHERE LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category))) = %s
+                WHERE {brand_expr} = %s
                 GROUP BY i.name, i.opening_qty
                 ORDER BY i.name
             """, (decoded_norm,))
+
             rows = cur.fetchall() or []
             conn.close()
-            return jsonify({"ok": True, "brand": decoded_brand, "items": convert_decimals(rows)})
 
-        # else: keep company-filtered behavior (strict)
+            # 🔥 Apply date formatting patch
+            rows = convert_decimals(rows)
+            for r in rows:
+                ed = r.get("end_date")
+                if not ed:
+                    r["end_date"] = "-"
+                    continue
+                try:
+                    if isinstance(ed, str):
+                        dt = datetime.fromisoformat(ed).date()
+                    else:
+                        dt = ed
+                    r["end_date"] = dt.strftime("%d-%m-%Y")
+                except:
+                    r["end_date"] = str(ed)
+
+            return jsonify({"ok": True, "brand": decoded_brand, "items": rows})
+
+        # -------------------------------
+        # Customer with company restriction (rare case)
+        # -------------------------------
         if not allowed.get("clauses"):
             conn.close()
             return jsonify({"ok": True, "brand": decoded_brand, "items": []})
 
         company_where = " OR ".join(allowed["clauses"])
         params = allowed["params"].copy()
-        # we still want to match brand on the item-brand field first param
         params.insert(0, decoded_brand)
 
         sql = f"""
@@ -1126,28 +1170,47 @@ def api_stock_items(brand):
                    IFNULL(SUM(r.qty), 0) AS reserved_qty,
                    (i.opening_qty - IFNULL(SUM(r.qty), 0)) AS available_qty,
                    MAX(r.reserved_by) AS reserved_by,
-                   DATE_FORMAT(MAX(r.end_date), '%%d-%%m-%%Y') AS end_date
+                   MAX(r.end_date) AS end_date
             FROM stock_items i
             LEFT JOIN stock_reservations r
               ON i.name = r.item AND r.status='ACTIVE'
             JOIN stock_movements m ON m.item = i.name
-            WHERE LOWER(TRIM(COALESCE(NULLIF(i.brand, ''), i.category))) = LOWER(TRIM(%s)) AND ({company_where})
+            WHERE {brand_expr} = LOWER(TRIM(%s)) AND ({company_where})
             GROUP BY i.name, i.opening_qty
             ORDER BY i.name
         """
         cur.execute(sql, tuple(params))
         rows = cur.fetchall() or []
         conn.close()
-        return jsonify({"ok": True, "brand": decoded_brand, "items": convert_decimals(rows)})
+
+        # 🔥 Apply same date formatting
+        rows = convert_decimals(rows)
+        for r in rows:
+            ed = r.get("end_date")
+            if not ed:
+                r["end_date"] = "-"
+                continue
+
+            try:
+                if isinstance(ed, str):
+                    dt = datetime.fromisoformat(ed).date()
+                else:
+                    dt = ed
+                r["end_date"] = dt.strftime("%d-%m-%Y")
+            except:
+                r["end_date"] = str(ed)
+
+        return jsonify({"ok": True, "brand": decoded_brand, "items": rows})
 
     except Exception as e:
         import traceback
         logging.exception("api_stock_items error: %s", e)
         try:
             conn.close()
-        except Exception:
+        except:
             pass
         return jsonify({"ok": False, "error": "Internal server error"}), 500
+
 
 # ---------------------------------------------------------
 # 🟢 7️⃣ Search Endpoint 
