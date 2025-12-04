@@ -1023,7 +1023,7 @@ def _build_month_slots(start_date: date, end_date: date):
 
 @app.route("/api/sales-summary/monthly")
 @requires_role("admin")
-def api_sales_monthly_overall():
+def api_sales_monthly_overallv2():
     """
     Returns monthly sales totals.
     Query params:
