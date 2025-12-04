@@ -763,6 +763,24 @@ def auto_release_reservations():
                 conn.close()
         except:
             pass
+# JSON POST login used by mobile / flutter clients (accepts JSON body)
+@app.route("/flask/login", methods=["POST", "OPTIONS"])
+def api_flask_login():
+    if request.method == "OPTIONS":
+        # CORS preflight handled by Flask-CORS usually, but respond defensively
+        return jsonify({"ok": True}), 200
+
+    data = request.get_json() or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"ok": False, "error": "username/password required"}), 400
+    user = get_user_by_username(username)
+    if not user or not check_password_hash(user["password_hash"], password):
+        return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+    token = create_token(user["id"], user["username"], user["role"])
+    return jsonify({"ok": True, "token": token, "user": user["username"], "role": user["role"]}), 200
+
 
 # Use sales table for summaries instead of stock_movements
 # Assumes `sales` table includes columns: date, voucher_no, company, item, qty, rate, amount, party_ledger, ledger_name
