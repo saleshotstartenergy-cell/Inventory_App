@@ -763,7 +763,7 @@ def auto_release_reservations():
                 conn.close()
         except:
             pass
-
+'''
 # ---------------------------
 # API endpoints for Flutter / clients
 # ---------------------------
@@ -909,6 +909,387 @@ def api_sales_monthly(brand):
             conn.close()
         except:
             pass
+'''
+# Use sales table for summaries instead of stock_movements
+# Assumes `sales` table includes columns: date, voucher_no, company, item, qty, rate, amount, party_ledger, ledger_name
+
+@app.route("/api/sales-summary")
+@requires_role("admin")
+def api_sales_summary():
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # Use sales.amount (assuming positive sale amounts). If negative signs exist for returns, you may need ABS or filter.
+        cur.execute("SELECT SUM(amount) AS total FROM sales")
+        row = cur.fetchone()
+        # cursor.fetchone() may return tuple or dict depending on cursor setup
+        if not row:
+            total = 0
+        else:
+            if isinstance(row, (list, tuple)):
+                total = row[0] or 0
+            elif isinstance(row, dict):
+                total = row.get("total") or 0
+            else:
+                total = getattr(row, "total", 0) or 0
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except:
+            pass
+    total = convert_decimals(total)
+    return jsonify({"ok": True, "total_sales": total})
+
+@app.route("/api/sales-summary/monthly")
+@requires_role("admin")
+def api_sales_monthly_overall():
+    """
+    Returns monthly sales totals across all brands/items.
+    Optional query params:
+      - year: integer year (e.g. 2024) to restrict results
+      - start: 'YYYY-MM' inclusive (overrides year if provided)
+      - end:   'YYYY-MM' inclusive (overrides year if provided)
+    Response:
+      { "ok": True, "months": [{"month":"January 2025","sort_key":"2025-01","value":12345.67}, ...] }
+    """
+    year_arg = request.args.get("year", "").strip()
+    start_arg = request.args.get("start", "").strip()  # 'YYYY-MM'
+    end_arg = request.args.get("end", "").strip()      # 'YYYY-MM'
+
+    year = None
+    try:
+        if year_arg:
+            year = int(year_arg)
+    except Exception:
+        year = None
+
+    conn = None
+    cur = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
+        sql = """
+            SELECT
+                DATE_FORMAT(date, '%M %Y') AS month,
+                DATE_FORMAT(date, '%Y-%m') AS sort_key,
+                SUM(amount) AS value
+            FROM sales
+            WHERE 1=1
+        """
+        params = []
+
+        # apply filters
+        if start_arg and end_arg:
+            # expect 'YYYY-MM'
+            try:
+                sql += " AND DATE_FORMAT(date, '%Y-%m') BETWEEN %s AND %s"
+                params.extend([start_arg, end_arg])
+            except Exception:
+                pass
+        elif start_arg:
+            sql += " AND DATE_FORMAT(date, '%Y-%m') >= %s"
+            params.append(start_arg)
+        elif end_arg:
+            sql += " AND DATE_FORMAT(date, '%Y-%m') <= %s"
+            params.append(end_arg)
+        elif year is not None:
+            sql += " AND YEAR(date) = %s"
+            params.append(year)
+
+        sql += " GROUP BY sort_key, month ORDER BY sort_key ASC"
+
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall() or []
+        rows = convert_decimals(rows)
+        return jsonify({"ok": True, "months": rows})
+    except Exception as e:
+        logging.exception("api_sales_monthly_overall error: %s", e)
+        tb = traceback.format_exc().splitlines()[-8:]
+        return jsonify({"ok": False, "error": "Internal server error", "detail": str(e), "trace": tb}), 500
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/api/sales-summary/brands")
+def api_sales_brands():
+    q = request.args.get("q", "").strip().lower()
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
+        # Prefer company from sales, otherwise category from stock_items
+        inner = """
+            SELECT
+              COALESCE(NULLIF(TRIM(s.company), ''), NULLIF(TRIM(i.category), ''), 'Uncategorized') AS brand,
+              COALESCE(s.amount, 0) AS amt
+            FROM sales s
+            LEFT JOIN stock_items i ON s.item = i.name
+        """
+
+        if q:
+            sql = f"""
+                SELECT brand, SUM(amt) AS value
+                FROM ({inner}) AS x
+                WHERE LOWER(brand) LIKE %s
+                GROUP BY brand
+                ORDER BY value DESC
+            """
+            params = (f"%{q}%",)
+        else:
+            sql = f"""
+                SELECT brand, SUM(amt) AS value
+                FROM ({inner}) AS x
+                GROUP BY brand
+                ORDER BY value DESC
+            """
+            params = ()
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+        rows = convert_decimals(rows)
+        return jsonify({"ok": True, "brands": rows})
+    except Exception as e:
+        logging.exception("api_sales_brands error: %s", e)
+        tb = traceback.format_exc().splitlines()[-8:]
+        return jsonify({"ok": False, "error": "Internal server error", "detail": str(e), "trace": tb}), 500
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except:
+            pass
+
+
+import calendar
+from datetime import date, datetime, timedelta
+from flask import jsonify, request
+from urllib.parse import unquote_plus
+import traceback
+
+def _parse_bool(v):
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
+
+def _build_month_slots(start_date: date, end_date: date):
+    """Return list of (sort_key 'YYYY-MM', label 'Month YYYY') from start_date to end_date inclusive by month."""
+    slots = []
+    cur = date(start_date.year, start_date.month, 1)
+    while cur <= end_date:
+        sort_key = cur.strftime("%Y-%m")
+        label = f"{calendar.month_name[cur.month]} {cur.year}"
+        slots.append((sort_key, label))
+        # advance one month
+        if cur.month == 12:
+            cur = date(cur.year + 1, 1, 1)
+        else:
+            cur = date(cur.year, cur.month + 1, 1)
+    return slots
+
+@app.route("/api/sales-summary/monthly")
+@requires_role("admin")
+def api_sales_monthly_overall():
+    """
+    Returns monthly sales totals.
+    Query params:
+      - year: integer. If fiscal=true, interpreted as fiscal start year (Apr year -> Mar year+1).
+              If not fiscal, interpreted as calendar year (Jan-Dec).
+      - fiscal: 'true'|'1' to use financial year mode (April -> March).
+      - start, end: optional 'YYYY-MM' to override and define exact inclusive month range (these override year/fiscal).
+    Response:
+      { "ok": True, "months": [{"month":"April 2024","sort_key":"2024-04","value":123.45}, ...] }
+    """
+    year_arg = request.args.get("year", "").strip()
+    start_arg = request.args.get("start", "").strip()
+    end_arg = request.args.get("end", "").strip()
+    fiscal = _parse_bool(request.args.get("fiscal"))
+
+    # determine date range
+    try:
+        if start_arg and end_arg:
+            # expect 'YYYY-MM'
+            start_date = datetime.strptime(start_arg + "-01", "%Y-%m-%d").date()
+            # end date -> last day of month
+            y, m = map(int, end_arg.split("-"))
+            end_date = date(y, m, 1)
+            # advance to last day
+            if end_date.month == 12:
+                end_date = date(end_date.year + 1, 1, 1) - timedelta(days=1)
+            else:
+                end_date = date(end_date.year, end_date.month + 1, 1) - timedelta(days=1)
+        else:
+            year = None
+            if year_arg:
+                try:
+                    year = int(year_arg)
+                except Exception:
+                    year = None
+            today = date.today()
+            if fiscal:
+                if year is None:
+                    # compute current fiscal start year
+                    # if month >= April, fiscal start is current year, else previous year
+                    year = today.year if today.month >= 4 else today.year - 1
+                start_date = date(year, 4, 1)
+                end_date = date(year + 1, 3, 31)
+            else:
+                if year is None:
+                    year = today.year
+                start_date = date(year, 1, 1)
+                end_date = date(year, 12, 31)
+    except Exception as e:
+        logging.exception("Invalid date filter: %s", e)
+        return jsonify({"ok": False, "error": "Invalid date filters"}), 400
+
+    # query aggregated month sums (grouped by YYYY-MM)
+    conn = None
+    cur = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+        sql = """
+            SELECT DATE_FORMAT(date, '%Y-%m') AS sort_key,
+                   DATE_FORMAT(date, '%M %Y') AS month,
+                   SUM(amount) AS value
+            FROM sales
+            WHERE date BETWEEN %s AND %s
+            GROUP BY sort_key, month
+            ORDER BY sort_key
+        """
+        params = (start_date.isoformat(), end_date.isoformat())
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+        # build lookup
+        sums = {r["sort_key"]: float(r["value"] or 0) for r in rows}
+
+        # build month slots and fill zeros for missing months, respecting fiscal ordering if requested
+        slots = _build_month_slots(start_date, end_date)
+        # If fiscal requested and the span is exactly Apr->Mar, ensure order is Apr->Mar (slots already in chronological order)
+        months_out = []
+        for sort_key, label in slots:
+            months_out.append({"month": label, "sort_key": sort_key, "value": sums.get(sort_key, 0.0)})
+
+        return jsonify({"ok": True, "months": months_out})
+    except Exception as e:
+        logging.exception("api_sales_monthly_overall error: %s", e)
+        tb = traceback.format_exc().splitlines()[-8:]
+        return jsonify({"ok": False, "error": "Internal server error", "detail": str(e), "trace": tb}), 500
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/api/sales-summary/brands/<path:brand>/monthly")
+@requires_role("admin")
+def api_sales_monthly_brand(brand):
+    """
+    Monthly sales totals for a specific brand (category or party ledger).
+    Query params same as /api/sales-summary/monthly
+    'brand' is URL-encoded; matching tries party_ledger/company first, fallback to stock_items.category if needed.
+    """
+    decoded_brand = unquote_plus(brand or "").strip()
+    year_arg = request.args.get("year", "").strip()
+    start_arg = request.args.get("start", "").strip()
+    end_arg = request.args.get("end", "").strip()
+    fiscal = _parse_bool(request.args.get("fiscal"))
+
+    # determine date range (same logic as overall)
+    try:
+        if start_arg and end_arg:
+            start_date = datetime.strptime(start_arg + "-01", "%Y-%m-%d").date()
+            y, m = map(int, end_arg.split("-"))
+            end_date = date(y, m, 1)
+            if end_date.month == 12:
+                end_date = date(end_date.year + 1, 1, 1) - timedelta(days=1)
+            else:
+                end_date = date(end_date.year, end_date.month + 1, 1) - timedelta(days=1)
+        else:
+            year = None
+            if year_arg:
+                try:
+                    year = int(year_arg)
+                except Exception:
+                    year = None
+            today = date.today()
+            if fiscal:
+                if year is None:
+                    year = today.year if today.month >= 4 else today.year - 1
+                start_date = date(year, 4, 1)
+                end_date = date(year + 1, 3, 31)
+            else:
+                if year is None:
+                    year = today.year
+                start_date = date(year, 1, 1)
+                end_date = date(year, 12, 31)
+    except Exception as e:
+        logging.exception("Invalid date filter (brand endpoint): %s", e)
+        return jsonify({"ok": False, "error": "Invalid date filters"}), 400
+
+    conn = None
+    cur = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
+        # Prefer matching party_ledger/company fields if you populate them in sales.
+        # If you instead want to match stock_items.category, replace the WHERE clause with a JOIN on stock_items.
+        sql_inner = """
+            SELECT date, amount
+            FROM sales
+            WHERE (LOWER(TRIM(COALESCE(party_ledger, ''))) = LOWER(TRIM(%s))
+                   OR LOWER(TRIM(COALESCE(company, ''))) = LOWER(TRIM(%s)))
+              AND date BETWEEN %s AND %s
+        """
+        params = [decoded_brand, decoded_brand, start_date.isoformat(), end_date.isoformat()]
+
+        sql = f"""
+            SELECT DATE_FORMAT(date, '%Y-%m') AS sort_key,
+                   DATE_FORMAT(date, '%M %Y') AS month,
+                   SUM(amount) AS value
+            FROM ({sql_inner}) AS t
+            GROUP BY sort_key, month
+            ORDER BY sort_key
+        """
+
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall() or []
+        sums = {r["sort_key"]: float(r["value"] or 0) for r in rows}
+
+        slots = _build_month_slots(start_date, end_date)
+        months_out = [{"month": label, "sort_key": sort_key, "value": sums.get(sort_key, 0.0)} for sort_key, label in slots]
+
+        # optional: compute total if you want to return it
+        total = sum(m["value"] for m in months_out)
+
+        return jsonify({"ok": True, "brand": decoded_brand, "months": months_out, "total": total})
+    except Exception as e:
+        logging.exception("api_sales_monthly_brand error: %s", e)
+        tb = traceback.format_exc().splitlines()[-8:]
+        return jsonify({"ok": False, "error": "Internal server error", "detail": str(e), "trace": tb}), 500
+    finally:
+        try:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
 
 @app.route("/api/stock-summary")
 @token_or_session_required
